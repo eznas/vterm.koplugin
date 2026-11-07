@@ -1,0 +1,5 @@
+#!/bin/sh
+# 插件 busybox(Unicode 重编, LAST_SUPPORTED_WCHAR=65535)的 ls:
+# 中文文件名原生正确, 取代旧 ls_utf8.sh 的 find 注入方案。
+# PATH 已把本目录置顶, shell 里敲 ls 即命中本包装。
+exec /mnt/us/koreader/plugins/vterm.koplugin/bin/busybox ls "$@"

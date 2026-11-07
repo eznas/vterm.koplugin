@@ -1,0 +1,13 @@
+" vterm 插件真机 vim 预设: 宽字符编辑 + gzip 压缩帮助(:h), 不在 FAT32 上留状态文件
+set nocompatible
+set encoding=utf-8
+set backspace=indent,eol,start
+set noswapfile
+set nobackup
+set viminfo=
+" 帮助文件已 gzip 压缩(doc/*.txt.gz + tags 指向 .gz), 解压走 PATH 的 busybox gunzip
+if exists('$VIMRUNTIME')
+    let &helpfile = $VIMRUNTIME . '/doc/help.txt.gz'
+endif
+filetype on
+syntax on

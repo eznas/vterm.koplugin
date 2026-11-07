@@ -1,0 +1,8 @@
+#!/bin/sh
+# 真 vim(9.1 静态宽字符交叉编译): 字符级删除/显示列光标/原生中文折行。
+# editor.kind=wide → vterm 插件按字符级语义(1 个退格删 1 字, 跳过字节列换算)。
+# 旧 busybox vi 仍可经 `vi` 命令使用(字节级, 见 bin/vi)。
+( printf wide > "$(dirname "$0")/editor.kind" 2>/dev/null ) || true
+# 帮助文件(:h)位置: 插件自带 vimruntime(doc/*.txt.gz + tags + gzip.vim)
+export VIMRUNTIME=/mnt/us/koreader/plugins/vterm.koplugin/vimruntime
+exec /mnt/us/koreader/plugins/vterm.koplugin/bin/vim.real -u /mnt/us/koreader/plugins/vterm.koplugin/bin/vimrc "$@"

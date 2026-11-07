@@ -1,0 +1,14 @@
+# runtime / personal data — never commit
+sessions.json
+keys/
+*.log
+fb.raw
+*.png
+!docs/*.png
+
+# runtime flags & markers
+imetest.on
+echo.dbg.on
+geslog.on
+native.off
+bin/editor.kind

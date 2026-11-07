@@ -1,0 +1,3 @@
+#!/bin/sh
+# busybox gunzip 包装(gzip.vim 按 PATH 里的 gunzip 名调用; FAT32 无 symlink 用脚本)
+exec /mnt/us/koreader/plugins/vterm.koplugin/bin/busybox gunzip "$@"

@@ -1402,11 +1402,57 @@ function VTermPlugin:showSettings()
         bt = bt and bt[4] and bt[4][1] -- [4]=CenterContainer → [1]=ButtonTable
         if not bt or not bt.buttons_layout then return end
         local last = bt.buttons_layout[#bt.buttons_layout]
-        local ok = last[#last]
-        if ok and ok.enable then
-            if enable then ok:enable() else ok:disable() end
-            -- Button:enable/disable 只改字段/字色, 不自带刷新 → 手动补脏区
-            if ok.dimen then UIManager:setDirty(d, "ui", ok.dimen) end
+        for _, b in ipairs(last) do
+            if type(b) == "table" and b.text == d.ok_text and b.enable then
+                if enable then b:enable() else b:disable() end
+                -- Button:enable/disable 只改字段/字色, 不自带刷新 → 手动补脏区
+                if b.dimen then UIManager:setDirty(d, "ui", b.dimen) end
+            end
+        end
+    end
+    -- 按钮排重建: 上行整行"关于"(原"恢复默认"的位置), 最下排 关闭|恢复默认|应用
+    -- (官方 DoubleSpinWidget 无此布局 → 重建 ButtonTable)
+    local function rebuildButtons(d)
+        local vg = d.widget_frame and d.widget_frame[1]
+        if not vg or rawget(d, "_vt_btns") then return end
+        local ButtonTable = require("ui/widget/buttontable")
+        local rows = {
+            { { text = _("关于"), callback = function() self:showAbout() end } },
+        }
+        local ok_enabled = d.ok_always_enabled or d.left_value ~= d.left_widget:getValue()
+            or d.right_value ~= d.right_widget:getValue()
+        rows[#rows + 1] = {
+            { text = d.cancel_text, callback = function()
+                if d.cancel_callback then d.cancel_callback() end
+                d:onClose()
+            end },
+            { text = d.default_text, callback = function()
+                d.left_widget.value = d.left_default
+                d.right_widget.value = d.right_default
+                d.left_widget:update()
+                d.right_widget:update()
+            end },
+            { text = d.ok_text, enabled = ok_enabled, callback = function()
+                d.left_value = d.left_widget:getValue()
+                d.right_value = d.right_widget:getValue()
+                if d.callback then d.callback(d.left_value, d.right_value) end
+                if d.keep_shown_on_apply then d:update() else d:onClose() end
+            end },
+        }
+        local newbt = ButtonTable:new{
+            width = d.width - 2 * Size.padding.default,
+            buttons = rows,
+            zero_sep = true,
+            show_parent = d,
+        }
+        vg[4] = CenterContainer:new{
+            dimen = Geom:new{ w = d.width, h = newbt:getSize().h },
+            newbt,
+        }
+        if vg.resetLayout then vg:resetLayout() end
+        d._vt_btns = newbt
+        if d._vt_title_pending ~= nil then
+            setOkEnabled(d, true) -- 重建后待定态仍在: 保持应用键点亮
         end
     end
     local function addTitleInfoToggle(d)
@@ -1444,53 +1490,15 @@ function VTermPlugin:showSettings()
             setOkEnabled(d, true) -- 重建后待定态仍在: 保持应用键点亮
         end
     end
-    -- "关于"入口: 标题条右上角(Noto Sans 20, 右留 20px), 点击弹插件信息。
-    -- 左上角是"终端设置"标题, 故放右上; 标题条每次 update() 重建, 同样包一层重插。
-    local function addAbout(d)
-        local vg0 = d.widget_frame and d.widget_frame[1]
-        local tb = vg0 and vg0[1] -- DoubleSpinWidget 未把 title_bar 挂 self, 从布局树取
-        if not tb or not tb.title_group or rawget(tb, "_vt_about") then return end
-        local TextWidget = require("ui/widget/textwidget")
-        local HorizontalGroup = require("ui/widget/horizontalgroup")
-        local HorizontalSpan = require("ui/widget/horizontalspan")
-        local InputContainer = require("ui/widget/container/inputcontainer")
-        local GestureRange = require("ui/gesturerange")
-        local Font = require("ui/font")
-        local about = TextWidget:new{
-            text = _("关于"), face = Font:getFace("NotoSans-Regular.ttf", 20), padding = 0,
-        }
-        local holder = HorizontalGroup:new{
-            align = "top",
-            about,
-            HorizontalSpan:new{ width = 20 }, -- 右侧留白 20px
-        }
-        -- overlap_align="right" → OverlapGroup 自行右对齐本容器
-        local wrap = WidgetContainer:new{ overlap_align = "right", holder }
-        local tap = InputContainer:new{ overlap_align = "right" }
-        local tw = about:getSize().w
-        tap.dimen = Geom:new{ w = tw + 40, h = tb.titlebar_height or 40 }
-        tap.ges_events = { TapAbout = { GestureRange:new{ ges = "tap", range = tap.dimen } } }
-        tap.onTapAbout = function()
-            self:showAbout()
-            return true
-        end
-        -- 手势范围用屏幕绝对坐标: paint 时由 OverlapGroup 传入的 x,y 回填
-        tap.paintTo = function(s, bb, x, y)
-            s.dimen.x = x
-            s.dimen.y = y
-        end
-        table.insert(tb, wrap)
-        table.insert(tb, tap)
-        tb._vt_about = { wrap = wrap, tap = tap }
-    end
     addTitleInfoToggle(dlg)
-    addAbout(dlg)
+    rebuildButtons(dlg)
     local orig_update = dlg.update
     dlg.update = function(dself, l, r)
         orig_update(dself, l, r)
-        dself._vt_cb = nil -- 重建后旧引用作废
+        dself._vt_cb = nil   -- 重建后旧引用作废
+        dself._vt_btns = nil
         addTitleInfoToggle(dself)
-        addAbout(dself)
+        rebuildButtons(dself)
     end
     UIManager:show(dlg)
 end
@@ -3047,10 +3055,19 @@ function VTermPlugin:_runToolbarSuite()
         dlg.callback(18, 2000)
         assert(G_reader_settings:readSetting("vterm_title_info") ~= false, "应用未恢复开启")
         assert(self._title_info ~= nil, "应用后未重挂信息组件")
-        -- "关于"入口(标题条右上) + 弹窗内容
-        local tba = dlg.widget_frame[1][1] -- DoubleSpinWidget 布局树: [1]=TitleBar
-        assert(tba and rawget(tba, "_vt_about"), "关于入口未挂载")
-        tba._vt_about.tap.onTapAbout()
+        -- "关于"按键(extra 行, 与"恢复默认"同款) + 弹窗内容
+        local bt = dlg.widget_frame[1][4][1] -- [4]=CenterContainer → [1]=ButtonTable
+        local about_cb
+        for _, row in ipairs(bt.buttons_layout or {}) do
+            for _, b in ipairs(row) do
+                if type(b) == "table" and type(b.text) == "string"
+                    and (b.text:find("关于") or b.text:find("bout")) then
+                    about_cb = b.callback
+                end
+            end
+        end
+        assert(about_cb, "关于按键未找到")
+        about_cb()
         local info_top
         for _, e in ipairs(UIManager._window_stack or {}) do
             if e.widget and type(e.widget.text) == "string" and e.widget.text:find("GitHub") then

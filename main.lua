@@ -862,10 +862,18 @@ function VTermPlugin:startTerminal(session, opts)
 
     -- 6. 派生 PTY 子进程
     local cur_path = os.getenv("PATH") or "/bin:/usr/bin"
-    local plugin_bin = self.path .. "/bin"
-    local locale_dir = self.path .. "/locale"
+    -- self.path 在部分 KOReader 版本是相对安装目录的(如 "plugins/xxx.koplugin")
+    -- → PATH 相对项只在 /mnt/us/koreader 下能解析, cd 别处后 vim 等全部
+    -- "not found"(editor.kind 标记也会写错位置)。会话 env 必须用绝对路径。
+    local plugin_abs = self.path
+    if plugin_abs:sub(1, 1) ~= "/" then
+        local lfs = require("libs/libkoreader-lfs")
+        plugin_abs = (lfs.currentdir() .. "/" .. plugin_abs):gsub("/%./", "/")
+    end
+    local plugin_bin = plugin_abs .. "/bin"
+    local locale_dir = plugin_abs .. "/locale"
     local env_vars = {
-        PLUGIN_DIR = self.path,
+        PLUGIN_DIR = plugin_abs,
         PATH = plugin_bin .. ":" .. cur_path,
         -- LOCPATH 指向插件自带的编译产物(Kindle 系统无任何 UTF-8 locale,
         -- bash readline 无多字节模式 → 中文按字节处理: 回显 ?、退格撕裂)。
@@ -877,7 +885,7 @@ function VTermPlugin:startTerminal(session, opts)
         -- Kindle 系统 terminfo 无 xterm 系列 → clear/less/tput 等报
         -- "unknown terminal type"; 插件自带编译条目(terminfo/x/),
         -- TERMINFO 指过去即可。远程会话不受影响(远端用自己的库)。
-        TERMINFO = self.path .. "/terminfo",
+        TERMINFO = plugin_abs .. "/terminfo",
         -- [V] 为 pty.lua 行模式检测标记(回车失效/提示符激活, 区分 shell 行与 vi 全屏态)
         PS1 = "\\w [V]\\$ ",
     }

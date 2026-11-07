@@ -21,7 +21,12 @@ local gettext = require("gettext")
 local EN_STRS = {
     ["VTerm 增强终端 (PuTTY)"] = "VTerm Enhanced Terminal (PuTTY)",
     ["打开 VTerm 终端"] = "Open VTerm Terminal",
-    ["本地 Shell (Bash / Vim)"] = "Local Shell (Bash / Vim)",
+    ["本地 Shell"] = "Local Shell",
+    ["关于"] = "About",
+    ["VTerm 增强终端"] = "VTerm Enhanced Terminal",
+    ["基于 libvterm · 本地 Shell · SSH 会话"] = "libvterm core · local shell · SSH sessions",
+    ["刷新屏幕: 点击标题栏任意位置(整屏黑闪清残影)"] = "Refresh screen: tap anywhere on the title bar (full flash clears ghosting)",
+    ["设置与开关: 终端内 ⚙ 设置"] = "Settings & toggles: ⚙ Settings inside the terminal",
     ["+ 新建远程 SSH 会话"] = "+ New Remote SSH Session",
     ["新建远程 SSH 会话 (类似 PuTTY)"] = "New Remote SSH Session (PuTTY-like)",
     ["⚙ 设置"] = "⚙ Settings",
@@ -64,6 +69,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
+local VTERM_VERSION = "v1.1.0" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -495,7 +501,7 @@ end
 function VTermPlugin:getSubMenuItems()
     local items = {
         {
-            text = _("本地 Shell (Bash / Vim)"),
+            text = _("本地 Shell"),
             callback = function()
                 self:startTerminal({ type = "local" })
             end,
@@ -521,7 +527,7 @@ function VTermPlugin:getSubMenuItems()
         for i, sess in ipairs(sessions) do
             if sess.type == "ssh" then
                 n = n + 1
-                local label = string.format("%d. %s (%s@%s:%s)", n, sess.name or "Unnamed", sess.user or "root", sess.host or "", sess.port or "22")
+                local label = string.format("%d. %s", n, sess.name or "SSH") -- 只显名称, 主机/端口不进列表
                 table.insert(items, {
                     text = label,
                     callback = function()
@@ -670,7 +676,7 @@ function VTermPlugin:startTerminal(session, opts)
         end
     end
 
-    local title_text = (session.type == "ssh") and string.format("SSH: %s (%s)", session.name or "Host", session.host) or "VTerm Terminal"
+    local title_text = (session.type == "ssh") and (session.name or "SSH") or "VTerm Terminal" -- 标题只显会话名
 
     -- 构造标准的 InputDialog 按钮表 (由底层 ButtonTable 严格分配触控区域)
     -- 开关状态显示: Button:callback() 不传参、text 也不解析 <u> 标记,
@@ -1339,6 +1345,19 @@ function VTermPlugin:_closeHostMenu()
     if self.ui and self.ui.menu then pcall(function() self.ui.menu:onClose() end) end
 end
 
+-- 关于弹窗: 插件信息 / GitHub / 屏幕刷新方法 / 版本
+function VTermPlugin:showAbout()
+    local T = require("ffi/util").template
+    local text = table.concat({
+        T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
+        _("基于 libvterm · 本地 Shell · SSH 会话"),
+        "GitHub: https://github.com/eznas/vterm.koplugin",
+        _("刷新屏幕: 点击标题栏任意位置(整屏黑闪清残影)"),
+        _("设置与开关: 终端内 ⚙ 设置"),
+    }, "\n")
+    UIManager:show(InfoMessage:new{ text = text })
+end
+
 function VTermPlugin:showSettings()
     self:_closeHostMenu()
     local DoubleSpinWidget = require("ui/widget/doublespinwidget")
@@ -1425,12 +1444,53 @@ function VTermPlugin:showSettings()
             setOkEnabled(d, true) -- 重建后待定态仍在: 保持应用键点亮
         end
     end
+    -- "关于"入口: 标题条右上角(Noto Sans 20, 右留 20px), 点击弹插件信息。
+    -- 左上角是"终端设置"标题, 故放右上; 标题条每次 update() 重建, 同样包一层重插。
+    local function addAbout(d)
+        local vg0 = d.widget_frame and d.widget_frame[1]
+        local tb = vg0 and vg0[1] -- DoubleSpinWidget 未把 title_bar 挂 self, 从布局树取
+        if not tb or not tb.title_group or rawget(tb, "_vt_about") then return end
+        local TextWidget = require("ui/widget/textwidget")
+        local HorizontalGroup = require("ui/widget/horizontalgroup")
+        local HorizontalSpan = require("ui/widget/horizontalspan")
+        local InputContainer = require("ui/widget/container/inputcontainer")
+        local GestureRange = require("ui/gesturerange")
+        local Font = require("ui/font")
+        local about = TextWidget:new{
+            text = _("关于"), face = Font:getFace("NotoSans-Regular.ttf", 20), padding = 0,
+        }
+        local holder = HorizontalGroup:new{
+            align = "top",
+            about,
+            HorizontalSpan:new{ width = 20 }, -- 右侧留白 20px
+        }
+        -- overlap_align="right" → OverlapGroup 自行右对齐本容器
+        local wrap = WidgetContainer:new{ overlap_align = "right", holder }
+        local tap = InputContainer:new{ overlap_align = "right" }
+        local tw = about:getSize().w
+        tap.dimen = Geom:new{ w = tw + 40, h = tb.titlebar_height or 40 }
+        tap.ges_events = { TapAbout = { GestureRange:new{ ges = "tap", range = tap.dimen } } }
+        tap.onTapAbout = function()
+            self:showAbout()
+            return true
+        end
+        -- 手势范围用屏幕绝对坐标: paint 时由 OverlapGroup 传入的 x,y 回填
+        tap.paintTo = function(s, bb, x, y)
+            s.dimen.x = x
+            s.dimen.y = y
+        end
+        table.insert(tb, wrap)
+        table.insert(tb, tap)
+        tb._vt_about = { wrap = wrap, tap = tap }
+    end
     addTitleInfoToggle(dlg)
+    addAbout(dlg)
     local orig_update = dlg.update
     dlg.update = function(dself, l, r)
         orig_update(dself, l, r)
         dself._vt_cb = nil -- 重建后旧引用作废
         addTitleInfoToggle(dself)
+        addAbout(dself)
     end
     UIManager:show(dlg)
 end
@@ -2987,6 +3047,18 @@ function VTermPlugin:_runToolbarSuite()
         dlg.callback(18, 2000)
         assert(G_reader_settings:readSetting("vterm_title_info") ~= false, "应用未恢复开启")
         assert(self._title_info ~= nil, "应用后未重挂信息组件")
+        -- "关于"入口(标题条右上) + 弹窗内容
+        local tba = dlg.widget_frame[1][1] -- DoubleSpinWidget 布局树: [1]=TitleBar
+        assert(tba and rawget(tba, "_vt_about"), "关于入口未挂载")
+        tba._vt_about.tap.onTapAbout()
+        local info_top
+        for _, e in ipairs(UIManager._window_stack or {}) do
+            if e.widget and type(e.widget.text) == "string" and e.widget.text:find("GitHub") then
+                info_top = e.widget
+            end
+        end
+        assert(info_top, "关于弹窗未出现")
+        UIManager:close(info_top)
         -- 油漆完成后再截图留证并关对话框
         UIManager:scheduleIn(0.8, function()
             pcall(function()
@@ -3009,6 +3081,13 @@ function VTermPlugin:_runToolbarSuite()
         assert(type(tb._vt_tap.onTapTitleRefresh) == "function", "刷新回调缺失")
         assert(tb._vt_tap:onTapTitleRefresh() == true, "回调应返回 true(消费手势)")
         return "tap-layer ok"
+    end)
+
+    -- TB32 菜单/标题简化: 终端标题只显会话名(本地=VTerm Terminal, SSH=名称)
+    check("TB32 终端标题只显会话名", function()
+        local tt = self.dialog.title_bar and self.dialog.title_bar.title
+        assert(tt == "VTerm Terminal", "标题应只显会话名, 实得: " .. tostring(tt))
+        return "title=" .. tostring(tt)
     end)
 
     at(1.2, function()

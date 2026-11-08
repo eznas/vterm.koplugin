@@ -602,6 +602,7 @@ function VTermPlugin:showSessionEditor(sess, index)
                             cancel_text = _("保留"),
                             ok_callback = function()
                                 self.session_mgr:delete(index)
+                                self:_refreshHostMenu()
                                 UIManager:close(dialog)
                                 UIManager:show(InfoMessage:new{ text = _("已删除: ") .. (sess.name or ""), timeout = 2 })
                             end,
@@ -614,6 +615,7 @@ function VTermPlugin:showSessionEditor(sess, index)
                         local s = collect()
                         if s.host and #s.host > 0 then
                             self.session_mgr:add(s)
+                            self:_refreshHostMenu()
                             UIManager:close(dialog)
                             UIManager:show(InfoMessage:new{ text = _("已另存为: ") .. (s.name or s.host), timeout = 2 })
                         end
@@ -625,6 +627,7 @@ function VTermPlugin:showSessionEditor(sess, index)
                         local s = collect()
                         if s.host and #s.host > 0 then
                             self.session_mgr:update(index, s)
+                            self:_refreshHostMenu()
                             UIManager:close(dialog)
                             self:startTerminal(s)
                         end
@@ -1340,6 +1343,15 @@ function VTermPlugin:_stopTitleInfo()
     self._title_info = nil
     self._title_rc = nil
     if self.dialog then UIManager:setDirty(self.dialog, "ui") end
+end
+
+-- 会话数据变更后刷新宿主菜单列表(TouchMenu 的子表是打开时快照, 不刷不更新)
+function VTermPlugin:_refreshHostMenu()
+    if self.ui and self.ui.menu and self.ui.menu.updateItems then
+        pcall(function()
+            self.ui.menu:updateItems()
+        end)
+    end
 end
 
 function VTermPlugin:_closeHostMenu()
@@ -3070,6 +3082,9 @@ function VTermPlugin:_runToolbarSuite()
         return "about-ok"
     end)
 
+    -- TB33 会话编辑器链路诊断: 打开→模拟键盘改名→getText(与 collect 同源)
+    -- (mgr 层 update/save 已真机实证正常: RENAMED_DIAG 落盘成功)
+
     -- TB31 点击标题栏 = 全屏刷新: 点击层挂在 OverlapGroup 底层且回调可用
     check("TB31 标题栏点击刷新层挂载+回调", function()
         local tb = self.dialog and self.dialog.title_bar
@@ -3087,13 +3102,70 @@ function VTermPlugin:_runToolbarSuite()
         return "title=" .. tostring(tt)
     end)
 
+    -- TB33 触摸鼠标: 鼠标模式(pty 跟踪 DECSET)开启时 touch/tap/拖动/滚轮 → SGR 序列
+    check("TB33 触摸鼠标 SGR 翻译", function()
+        local v = self.view
+        local orig_send = v.sendBytes
+        local sent = {}
+        v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+        local oldpty = v.pty
+        v.pty = { mouse_click = true, mouse_drag = true }
+        local r = v:_gridRegion()
+        -- pos 用完整 Geom(真机手势事件如此; 缺 w/h 会让 contains() 算术崩)
+        local c = Geom:new{ x = r.x + math.floor(r.w / 2), y = r.y + math.floor(r.h / 2), w = 1, h = 1 }
+        v:onVTermTouch(nil, { pos = c }) -- 按下
+        v:onTapTextBox(nil, { pos = c }) -- tap 抬起 = 完整点击
+        v:onVTermTouch(nil, { pos = c }) -- 再按下
+        v:onVTermPan(nil, { pos = Geom:new{ x = c.x + v.cell_w * 2, y = c.y, w = 1, h = 1 } }) -- 拖动
+        v:onVTermPanRelease(nil, {}) -- 抬起
+        v:onVTermSwipe(nil, { direction = "north", pos = c }) -- 滚轮×3
+        v.pty = oldpty
+        v.sendBytes = orig_send
+        assert(sent[1] and sent[1]:match("\27%[<0;%d+;%d+M$"), "按下序列缺失: " .. tostring(sent[1]))
+        assert(sent[2] and sent[2]:match("\27%[<0;%d+;%d+m$"), "点击释放缺失: " .. tostring(sent[2]))
+        -- 真实语义: 点击(按下+释放) → 再按下 → 拖动 motion → 抬起 → 滚轮×3 = 8 发
+        assert(sent[3] and sent[3]:match("\27%[<0;%d+;%d+M$"), "二次按下缺失: " .. tostring(sent[3]))
+        assert(sent[4] and sent[4]:match("\27%[<32;%d+;%d+M$"), "拖动 motion 缺失: " .. tostring(sent[4]))
+        assert(sent[5] and sent[5]:match("\27%[<0;%d+;%d+m$"), "拖动释放缺失: " .. tostring(sent[5]))
+        assert(sent[6] and sent[6]:match("\27%[<64;%d+;%d+M$"), "滚轮缺失: " .. tostring(sent[6]))
+        assert(#sent == 8, "应 8 发(点2+拖2+滚3): n=" .. #sent)
+        return "sgr ok n=" .. #sent
+    end)
+
+    -- TB34 会话编辑器链路: 打开→模拟键盘改名→getText(与 保存连接 的 collect 同源)
+    -- (mgr 层 update/save 已真机实证正常; 放在 SGR 之后, 编辑器 UI 开关会干扰
+    --  其前的 view/geometry 类断言)
+    check("TB34 会话编辑器改名 getText", function()
+        local sm = self.session_mgr
+        local sessions = sm:list()
+        local idx
+        for i, s in ipairs(sessions) do
+            if s.type == "ssh" then idx = i break end
+        end
+        assert(idx, "无 ssh 会话")
+        self:showSessionEditor(sessions[idx], idx)
+        local ed
+        for _, e in ipairs(UIManager._window_stack or {}) do
+            local w2 = e.widget
+            if w2 and w2.input_fields then ed = w2 end
+        end
+        assert(ed, "编辑器未打开")
+        ed.input_fields[1]:delAll()
+        ed.input_fields[1]:addChars("RENAMED_EDITOR")
+        self:_suiteLog("TB34 editor-getText=" .. tostring(ed.input_fields[1]:getText()))
+        local vals = ed:getFields()
+        self:_suiteLog("TB34 collect-name=" .. tostring(vals[1]) .. " host=" .. tostring(vals[2]))
+        assert(vals[1] == "RENAMED_EDITOR", "collect 应取到新名: " .. tostring(vals[1]))
+        pcall(function() ed:onClose() end)
+        return "diag-done"
+    end)
+
     at(1.2, function()
         self:_suiteLog("TOOLBAR SUITE DONE")
-        -- 视觉留证: 用 KOReader 自带截图器把当前终端界面存到插件目录
+        -- 视觉留证: 静默截图(Device.screen:shot, 不用 Screenshoter——
+        -- 它会弹"已保存"通知且无超时, 无人值守时挡住输入让真机假死)
         local ok = pcall(function()
-            local Screenshoter = require("ui/widget/screenshoter")
-            local shot = Screenshoter:new{ ui = self.ui }
-            shot:onScreenshot("vterm_toolbar")
+            require("device").screen:shot(self.path .. "/vterm_toolbar.png")
         end)
         self:_suiteLog("SHOT " .. (ok and "OK" or "FAIL"))
         -- 套件跑完自动退出, 便于无人值守(模拟器/真机)

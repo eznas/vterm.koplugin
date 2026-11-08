@@ -5,6 +5,8 @@ set backspace=indent,eol,start
 set noswapfile
 set nobackup
 set viminfo=
+" 触摸鼠标: 终端侧把 tap/拖动/滚动翻译成 SGR 鼠标序列(vterm 会话专用)
+set mouse=a
 " 帮助文件已 gzip 压缩(doc/*.txt.gz + tags 指向 .gz), 解压走 PATH 的 busybox gunzip
 if exists('$VIMRUNTIME')
     let &helpfile = $VIMRUNTIME . '/doc/help.txt.gz'

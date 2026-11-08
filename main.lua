@@ -24,6 +24,7 @@ local EN_STRS = {
     ["本地 Shell"] = "Local Shell",
     ["关于"] = "About",
     ["VTerm 增强终端"] = "VTerm Enhanced Terminal",
+    ["(Tip: Tap anywhere on the title bar to refresh screen.)"] = "（提示: 点标题栏任意位置可整屏刷新清残影）",
     ["+ 新建远程 SSH 会话"] = "+ New Remote SSH Session",
     ["新建远程 SSH 会话 (类似 PuTTY)"] = "New Remote SSH Session (PuTTY-like)",
     ["⚙ 设置"] = "⚙ Settings",
@@ -1342,11 +1343,17 @@ function VTermPlugin:_closeHostMenu()
     if self.ui and self.ui.menu then pcall(function() self.ui.menu:onClose() end) end
 end
 
--- 关于弹窗: 只显名称与版本一行(无 ⓘ 图标)
+-- 关于弹窗: 名称版本 + GitHub 链接 + 刷新提示(无 ⓘ 图标)
 function VTermPlugin:showAbout()
     local T = require("ffi/util").template
+    local text = table.concat({
+        T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
+        "",
+        "https://github.com/eznas/vterm.koplugin",
+        _("(Tip: Tap anywhere on the title bar to refresh screen.)"),
+    }, "\n")
     UIManager:show(InfoMessage:new{
-        text = T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
+        text = text,
         show_icon = false,
     })
 end

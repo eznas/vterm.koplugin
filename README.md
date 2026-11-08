@@ -40,6 +40,10 @@ vim 9.1 editing a file with CJK text (fullwidth characters wrap correctly at the
   git clone https://github.com/eznas/vterm.koplugin.git
   ```
 
+### Vim help files (optional)
+
+Vim works out of the box, but the bundled `:help` documentation (~4 MB) is **not included in the release zip** to keep the download small. To install it, grab [`vimruntime.zip`](https://github.com/eznas/vterm.koplugin/releases/download/v1.0.0/vimruntime.zip), extract it into the plugin folder (so you get `vimruntime/doc/`), and `:h` works. Plugin upgrades never remove manually installed docs.
+
 ### SSH sessions
 
 The session manager looks for Dropbear's `dbclient` binary at (in order) the plugin's `bin/`, `/mnt/us/koreader/`, and `/usr/bin/`. Kindle stock OS already ships Dropbear; otherwise drop a static `dbclient` into `bin/`. Keys must be in Dropbear format — convert OpenSSH keys with `dropbearconvert` and store them under `keys/` (referenced as `key_path` in a session).

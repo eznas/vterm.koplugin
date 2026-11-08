@@ -40,6 +40,10 @@ vim 9.1 编辑中文文本（全角字符在行尾正确折行）：
   git clone https://github.com/eznas/vterm.koplugin.git
   ```
 
+### Vim 帮助文档（可选）
+
+vim 开箱即用，但 `:help` 帮助文档（约 4MB）**不打进发布 zip**（控制体积）。需要时下载 [vimruntime.zip](https://github.com/eznas/vterm.koplugin/releases/download/v1.0.0/vimruntime.zip)，解压到插件目录（得到 `vimruntime/doc/`）即可。插件升级不会删除手动安装的文档。
+
 ### SSH 会话
 
 会话管理器按以下顺序探测 `dbclient`（Dropbear 客户端）：插件 `bin/` → `/mnt/us/koreader/` → `/usr/bin/`。Kindle 官方系统自带 Dropbear；否则把静态 `dbclient` 放进 `bin/` 即可。密钥须为 Dropbear 格式（用 `dropbearconvert` 转换 OpenSSH 私钥），存放于 `keys/` 并在会话中填 `key_path`。

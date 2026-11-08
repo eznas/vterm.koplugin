@@ -44,6 +44,8 @@ local EN_STRS = {
     ["Esc"] = "Esc",
     [" ?"] = " ?",
     ["标题栏显示电量与时间"] = "Battery & clock in title bar",
+    ["帮助文档需另行安装: 从 GitHub Releases 下载 vimruntime.zip 解压到插件目录。"] =
+        "Help docs are optional: download vimruntime.zip from GitHub Releases and extract it into the plugin folder.",
     ["会话名称 (如: 我的VPS/Termux)"] = "Session name (e.g. my VPS/Termux)",
     ["主机 IP 或域名"] = "Host IP or domain",
     ["端口号 (默认 22)"] = "Port (default 22)",
@@ -1355,6 +1357,7 @@ function VTermPlugin:showAbout()
         _("增强终端，支持中文、Vim 等！"),
         "",
         _("提示: 点标题栏任意位置可整屏刷新清残影。"),
+        _("帮助文档需另行安装: 从 GitHub Releases 下载 vimruntime.zip 解压到插件目录。"),
         "",
         "https://github.com/eznas/vterm.koplugin",
     }, "\n")

@@ -24,9 +24,6 @@ local EN_STRS = {
     ["本地 Shell"] = "Local Shell",
     ["关于"] = "About",
     ["VTerm 增强终端"] = "VTerm Enhanced Terminal",
-    ["基于 libvterm · 本地 Shell · SSH 会话"] = "libvterm core · local shell · SSH sessions",
-    ["刷新屏幕: 点击标题栏任意位置(整屏黑闪清残影)"] = "Refresh screen: tap anywhere on the title bar (full flash clears ghosting)",
-    ["设置与开关: 终端内 ⚙ 设置"] = "Settings & toggles: ⚙ Settings inside the terminal",
     ["+ 新建远程 SSH 会话"] = "+ New Remote SSH Session",
     ["新建远程 SSH 会话 (类似 PuTTY)"] = "New Remote SSH Session (PuTTY-like)",
     ["⚙ 设置"] = "⚙ Settings",
@@ -490,7 +487,7 @@ end
 
 function VTermPlugin:addToMainMenu(menu_items)
     menu_items.vterm = {
-        text = _("VTerm 增强终端 (PuTTY)"),
+        text = _("VTerm 增强终端"),
         sorting_hint = "more_tools",
         sub_item_table_func = function()
             return self:getSubMenuItems()
@@ -514,6 +511,7 @@ function VTermPlugin:getSubMenuItems()
         },
         {
             text = _("⚙ 设置"),
+            separator = true, -- 官方菜单细分割线(TouchMenu split_line), 代替旧文字分隔
             callback = function()
                 self:showSettings()
             end,
@@ -522,7 +520,6 @@ function VTermPlugin:getSubMenuItems()
 
     local sessions = self.session_mgr:list()
     if #sessions > 1 then
-        table.insert(items, { text = "--------- " .. _("已存会话 (长按编辑)") .. " ---------" })
         local n = 0
         for i, sess in ipairs(sessions) do
             if sess.type == "ssh" then
@@ -1345,17 +1342,13 @@ function VTermPlugin:_closeHostMenu()
     if self.ui and self.ui.menu then pcall(function() self.ui.menu:onClose() end) end
 end
 
--- 关于弹窗: 插件信息 / GitHub / 屏幕刷新方法 / 版本
+-- 关于弹窗: 只显名称与版本一行(无 ⓘ 图标)
 function VTermPlugin:showAbout()
     local T = require("ffi/util").template
-    local text = table.concat({
-        T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
-        _("基于 libvterm · 本地 Shell · SSH 会话"),
-        "GitHub: https://github.com/eznas/vterm.koplugin",
-        _("刷新屏幕: 点击标题栏任意位置(整屏黑闪清残影)"),
-        _("设置与开关: 终端内 ⚙ 设置"),
-    }, "\n")
-    UIManager:show(InfoMessage:new{ text = text })
+    UIManager:show(InfoMessage:new{
+        text = T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
+        show_icon = false,
+    })
 end
 
 function VTermPlugin:showSettings()
@@ -3023,6 +3016,7 @@ function VTermPlugin:_runToolbarSuite()
     -- + 油漆后截图留证(0.8s 后), 收尾时间轴相应后移
     check("TB29 设置对话框勾选行: 待定态+点应用才保存", function()
         local orig_on = self:_titleInfoEnabled()
+        G_reader_settings:saveSetting("vterm_title_info", true) -- 入口强制开, 套件确定性
         self:showSettings()
         local dlg
         for _, e in ipairs(UIManager._window_stack or {}) do
@@ -3043,7 +3037,8 @@ function VTermPlugin:_runToolbarSuite()
         assert(okbtn.enabled == false, "无变更时应用键应禁用, 实得 " .. tostring(okbtn.enabled))
         -- 切到关: 只记待定态, 不持久化不生效
         cb:toggleCheck(); cb.callback()
-        assert(dlg._vt_title_pending == false, "待定态未记录")
+        assert(dlg._vt_title_pending == false, "待定态未记录: pending="
+            .. tostring(dlg._vt_title_pending) .. " checked=" .. tostring(cb.checked))
         assert(okbtn.enabled == true, "有待定态时应用键应点亮")
         assert(G_reader_settings:readSetting("vterm_title_info") ~= false, "未应用就持久化了")
         -- 点应用: 持久化 false + 标题条摘除
@@ -3070,7 +3065,8 @@ function VTermPlugin:_runToolbarSuite()
         about_cb()
         local info_top
         for _, e in ipairs(UIManager._window_stack or {}) do
-            if e.widget and type(e.widget.text) == "string" and e.widget.text:find("GitHub") then
+            if e.widget and type(e.widget.text) == "string"
+                and e.widget.text:find(VTERM_VERSION, 1, true) then
                 info_top = e.widget
             end
         end

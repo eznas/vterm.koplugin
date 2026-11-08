@@ -243,6 +243,26 @@ function PTY:read()
     if n > 0 then
         local raw = (self.read_carry or "") .. ffi.string(self.buffer, n)
         self.read_carry = ""
+        -- 鼠标上报模式跟踪: 应用(vim mouse=a 等)用 DECSET ?1000/1002(+1006 SGR)
+        -- 开关鼠标事件。libvterm 不暴露该状态 → 直接扫输出流(末尾留跨块拼接
+        -- 余量防序列被切半)。vterm_view 据此把触摸翻译成 SGR 鼠标序列。
+        do
+            local mcarry = (self.mouse_carry or ""):sub(-12) .. raw
+            self.mouse_carry = mcarry
+            for mode, en in mcarry:gmatch("\27%[(%?10%d%d)([hl])") do
+                local num = tonumber(mode:sub(2))
+                if num == 1000 then
+                    self.mouse_click = en == "h"
+                elseif num == 1002 then
+                    -- 1002 = 点击+拖动超集(远端 vim ttymouse=xterm2 时只发 1002
+                    -- 不发 1000), 必须同时点亮点击, 否则触摸全被忽略
+                    self.mouse_drag = en == "h"
+                    self.mouse_click = en == "h"
+                elseif num == 1006 then
+                    self.mouse_sgr = en == "h"
+                end
+            end
+        end
         if self.is_local then
             dbg("R %q q=%d st=%d la=%s", raw, #self.pending_utf8_chars,
                 #self.line_stack, tostring(self.line_active))
@@ -440,6 +460,7 @@ function PTY:write(data)
         -- 原生透传: 不做影子行/还原队列/行栈/历史拦截, 字节直写。
         -- 行激活跟踪仅服务退格粒度分派(delChar/_feedVterm): 回车即失效,
         -- 下一个 [V] 提示符由读侧重新检出。
+        dbg("WN %q la=%s", data, tostring(self.line_active))
         if self.line_active
             and (data:find("\r", 1, true) or data:find("\n", 1, true)) then
             self.line_active = false

@@ -70,7 +70,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.1.0" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.2.0" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -1584,12 +1584,18 @@ function VTermPlugin:_reattachVTerm()
     view.vt = self.vt
     view.screen = self.screen
     view.vt_lib = self.vt_lib
+    view.pty = self.pty -- ⚠️漏挂会让触摸鼠标失效(_mouseActive 读 pty.mouse_* 恒 nil)
     view._vt_write = function(data) self:_ptyWriteRoundtrip(data) end
     -- 布局切换(条带高度变化)引发 rows 变化时, 视图回调同步网格/PTY 尺寸
     view._vt_resize_cb = function() self:_applyTerminalSize() end
     view._vt_sb = self._vt_sb
     view._vt_sb_mode = (old and old._vt_sb_mode) or false
     view._vt_ctrl_pending = (old and old._vt_ctrl_pending) or false
+    view._vt_shift_mode = (old and (old._vt_shift_mode or (old.keyboard and old.keyboard.shiftmode))) or false
+    if view.keyboard and not view._vt_collapsed and view._vt_shift_mode then
+        view.keyboard.shiftmode = true
+        if view.keyboard.initLayer then view.keyboard:initLayer() end
+    end
     self:_patchTitleBar() -- toggleKeyboard 重建了 title_bar, 重挂时间/电量
 
     -- ⌨ 收起手术: 摘掉 vgroup 尾部的按钮栏容器, 空间让给终端网格。
@@ -2729,42 +2735,50 @@ function VTermPlugin:_runToolbarSuite()
         return "compass"
     end)
 
-    check("TB15 连发模型: 同向只发一次; 停顿后连发可启动; 抬起立即硬取消", function()
+    check("TB15 连发模型: 同向只发一次; 停住满 1s 事件驱动连发; 抬起停止", function()
         local v = self.view
-        v._vt_sb_mode = false -- 本测试验证纯方向词映射, 关掉 ⇕ 翻页路由
         v._vt_sb_mode = false -- 本测试验证纯方向词映射, 关掉 ⇕ 翻页路由
         v:setArrowGestures(true)
         local sent = {}
         local orig = v._vt_write
+        local orig_now = require("ui/time").now
         v._vt_write = function(s) sent[#sent + 1] = s end
         v:onVTermPan(nil, { direction = "south" }) -- 首键
         v:onVTermPan(nil, { direction = "south" }) -- 同向不发
-        v:onVTermPan(nil, { direction = "south" }) -- 同向不发
         v:onVTermPan(nil, { direction = "east" })  -- 换向再发一次
-        v:onVTermPan(nil, { direction = "east" })  -- 同向不发
         assert(#sent == 2 and sent[1] == "\27[B" and sent[2] == "\27[C",
             "滑动模型序列: " .. table.concat(sent, "|"))
-        v:_ensureLive()
-        v:_scheduleArrowRepeat() -- 模拟停顿 1s 到期后的连发启动
-        assert(v._vt_arrow_fn ~= nil, "连发应已启动")
-        v:_stopArrowRepeat()     -- 手指抬起: 硬取消
-        assert(v._vt_arrow_fn == nil and not v._vt_arrow_dir, "抬起应立即停")
+        -- 停住 -> 启动固定节拍连发时钟(_startRepeatClock), 抬起即停
+        -- (⚠️旧断言走定时器/事件驱动模型, 现为固定节拍时钟)
+        local Geom15 = require("ui/geometry")
+        local c15 = Geom15:new{ x = 300, y = 300 }
+        v:onVTermPan(nil, { direction = "east", pos = c15 })
+        v:onVTermPan(nil, { direction = "east", pos = c15 }) -- 停住: 起连发时钟
+        assert(v._vt_repeat_task ~= nil, "停住应启动连发时钟")
+        v:_stopArrowRepeat() -- 手指抬起
+        assert(not v._vt_arrow_dir and not v._vt_still_since, "抬起应立即停")
         v._vt_write = orig
         v:setArrowGestures(false)
         return "single+hold+stop"
     end)
 
-    check("TB16 停顿判定: 触摸抖动(<阈值)不打断 1s 停顿计时(真机按住不动 pos 仍微动 1~4px)", function()
+    check("TB16 停顿判定: 抖动(<阈值)不重置停住起点(真机按住不动 pos 仍微动 1~4px)", function()
         local Geom = require("ui/geometry")
         local v = self.view
         v._vt_sb_mode = false -- 本测试验证纯方向词映射, 关掉 ⇕ 翻页路由
         v:setArrowGestures(true)
-        v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 100, y = 100 } }) -- 建基准
-        local seq0 = v._vt_hold_seq
+        -- 本测试验证**非连发态**(无时钟)的停住/抖动/真移动判定;
+        -- 连发期间另有宽门槛(REPEAT_MOVE_PX), 不在此测
+        v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 100, y = 100 } }) -- 建基准+设方向
+        v._vt_repeat_task = nil -- 摘掉时钟, 回到非连发判定分支
         v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 105, y = 103 } }) -- 抖动 ~6px
-        assert(v._vt_hold_seq == seq0, "抖动不应重置停顿计时")
-        v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 140, y = 160 } }) -- 真移动
-        assert(v._vt_hold_seq == seq0 + 1, "真移动应重置停顿计时")
+        local still0 = v._vt_still_since
+        assert(still0 ~= nil, "抖动应进入停住态(起算停住起点)")
+        v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 105, y = 104 } }) -- 又一抖动
+        assert(v._vt_still_since == still0, "抖动不应重置停住起点")
+        v._vt_repeat_task = nil -- 防连发宽门槛干扰
+        v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = 140, y = 160 } }) -- 真移动 ~50px
+        assert(v._vt_still_since == nil, "真移动应清空停住起点(重新计时)")
         v:setArrowGestures(false)
         return "jitter-ok"
     end)
@@ -2779,8 +2793,7 @@ function VTermPlugin:_runToolbarSuite()
         assert(v._vt_arrow_dir, "网格内滑动应设方向")
         v:onVTermPan(nil, { direction = "south", pos = Geom:new{ x = g.x + 50, y = g.y + g.h + 100 } })
         assert(v._vt_arrow_dir == nil, "拖出网格应终止状态机")
-        v:_scheduleArrowRepeat() -- 模拟停顿计时到期: dir 已清, 连发不得启动
-        assert(v._vt_arrow_fn == nil, "出网格后连发不应启动")
+        assert(v._vt_repeat_task == nil, "出网格后连发不应启动")
         v:setArrowGestures(false)
         return "out-stop"
     end)
@@ -2798,8 +2811,7 @@ function VTermPlugin:_runToolbarSuite()
         v._vt_write = orig
         assert(#sent == 1, "pan+swipe 应只发一次(不双发): " .. #sent)
         assert(v._vt_arrow_dir == nil, "swipe 后方向状态应清空(停顿计时作废)")
-        v:_scheduleArrowRepeat()
-        assert(v._vt_arrow_fn == nil, "方向已清, 连发不得启动")
+        assert(v._vt_repeat_task == nil, "方向已清, 连发不得启动")
         -- 纯 swipe 手势(pan 流没发过): 仍应发一次
         local sent2 = {}
         v._vt_write = function(s) sent2[#sent2 + 1] = s end
@@ -2822,11 +2834,10 @@ function VTermPlugin:_runToolbarSuite()
         v:onVTermPan(nil, { direction = "north", pos = Geom:new{ x = 100, y = 100 } })
         assert(v._vt_arrow_dir == "north", "滑动应设方向")
         v:onVTermTouch(nil, {}) -- 手指落到键盘上打字(触摸按下)
-        assert(v._vt_arrow_dir == nil and v._vt_arrow_fn == nil, "touch 应作废滑动会话")
+        assert(v._vt_arrow_dir == nil and v._vt_repeat_task == nil, "touch 应作废滑动会话")
         assert(v._vt_last_pan_pos == nil, "touch 应清位置基准")
         -- 停顿计时代号已失效: 即使 1s 到期回调跑, dir=nil → 连发不启动
-        v:_scheduleArrowRepeat()
-        assert(v._vt_arrow_fn == nil, "作废后连发不得启动")
+        assert(v._vt_repeat_task == nil, "作废后连发不得启动")
         v._vt_write = orig
         v:setArrowGestures(false)
         return "touch-reset"
@@ -2994,11 +3005,30 @@ function VTermPlugin:_runToolbarSuite()
         v:_pageAction("south")()
         v.keyboard.shiftmode = false
         v:_pageAction("north")()
+        -- ⇆开+Shift 挂起: 上/下滑发远端 PageUp/PageDown(\27[5~/\27[6~)
+        v._vt_arrows = true
+        v.keyboard.shiftmode = true
+        v:_vtAction("north")()
+        v:_vtAction("south")()
+        v._vt_arrows = false
         v.keyboard = kbd
         v._vt_write = orig
         assert(sent[1] == "\27[5;2~" and sent[2] == "\27[6;2~" and sent[3] == "\27[5~",
             table.concat(sent, "|"))
-        return "5;2/6;2/plain"
+        assert(sent[4] == "\27[5~" and sent[5] == "\27[6~",
+            "vtAction-shift: " .. table.concat(sent, "|", 4))
+
+        -- 全屏收起键盘态模拟: keyboard 无 shiftmode, 但 _vt_shift_mode 保持
+        v._vt_collapsed = true
+        v.keyboard = {}
+        sent = {}
+        v:_vtAction("north")()
+        v:_vtAction("south")()
+        assert(sent[1] == "\27[5~" and sent[2] == "\27[6~",
+            "collapsed-shift: " .. table.concat(sent, "|"))
+        v._vt_collapsed = false
+
+        return "5;2/6;2/plain+vtshift+collapsed"
     end)
 
     -- TB27 Ctrl+] 经真实键盘入口(长按弹窗同款 keyboard:addChar)诊断:
@@ -3102,29 +3132,30 @@ function VTermPlugin:_runToolbarSuite()
         return "title=" .. tostring(tt)
     end)
 
-    -- TB33 触摸鼠标: 鼠标模式(pty 跟踪 DECSET)开启时 touch/tap/拖动/滚轮 → SGR 序列
+    -- TB33 触摸鼠标: 鼠标模式(pty 跟踪 DECSET)开启时 tap=点击/拖动/滚轮 → SGR
+    -- (真机 ges.log 实证 touch 事件 pos=nil → 点击在 tap 处按下+释放, 拖动在
+    --  hold_pan 首个事件建立按下)
     check("TB33 触摸鼠标 SGR 翻译", function()
         local v = self.view
         local orig_send = v.sendBytes
         local sent = {}
         v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
         local oldpty = v.pty
-        v.pty = { mouse_click = true, mouse_drag = true }
+        v.pty = { mouse_click = true, mouse_drag = true, mouse_sgr = true }
         local r = v:_gridRegion()
         -- pos 用完整 Geom(真机手势事件如此; 缺 w/h 会让 contains() 算术崩)
         local c = Geom:new{ x = r.x + math.floor(r.w / 2), y = r.y + math.floor(r.h / 2), w = 1, h = 1 }
-        v:onVTermTouch(nil, { pos = c }) -- 按下
-        v:onTapTextBox(nil, { pos = c }) -- tap 抬起 = 完整点击
-        v:onVTermTouch(nil, { pos = c }) -- 再按下
-        v:onVTermPan(nil, { pos = Geom:new{ x = c.x + v.cell_w * 2, y = c.y, w = 1, h = 1 } }) -- 拖动
+        v._vt_mouse_down = nil
+        v:onTapTextBox(nil, { pos = c }) -- 点击 = 按下+释放
+        v:onVTermPan(nil, { pos = Geom:new{ x = c.x + v.cell_w * 2, y = c.y, w = 1, h = 1 } }) -- 拖动: 建立按下
+        v:onVTermPan(nil, { pos = Geom:new{ x = c.x + v.cell_w * 4, y = c.y, w = 1, h = 1 } }) -- 拖动: motion
         v:onVTermPanRelease(nil, {}) -- 抬起
         v:onVTermSwipe(nil, { direction = "north", pos = c }) -- 滚轮×3
         v.pty = oldpty
         v.sendBytes = orig_send
-        assert(sent[1] and sent[1]:match("\27%[<0;%d+;%d+M$"), "按下序列缺失: " .. tostring(sent[1]))
+        assert(sent[1] and sent[1]:match("\27%[<0;%d+;%d+M$"), "点击按下缺失: " .. tostring(sent[1]))
         assert(sent[2] and sent[2]:match("\27%[<0;%d+;%d+m$"), "点击释放缺失: " .. tostring(sent[2]))
-        -- 真实语义: 点击(按下+释放) → 再按下 → 拖动 motion → 抬起 → 滚轮×3 = 8 发
-        assert(sent[3] and sent[3]:match("\27%[<0;%d+;%d+M$"), "二次按下缺失: " .. tostring(sent[3]))
+        assert(sent[3] and sent[3]:match("\27%[<0;%d+;%d+M$"), "拖动按下缺失: " .. tostring(sent[3]))
         assert(sent[4] and sent[4]:match("\27%[<32;%d+;%d+M$"), "拖动 motion 缺失: " .. tostring(sent[4]))
         assert(sent[5] and sent[5]:match("\27%[<0;%d+;%d+m$"), "拖动释放缺失: " .. tostring(sent[5]))
         assert(sent[6] and sent[6]:match("\27%[<64;%d+;%d+M$"), "滚轮缺失: " .. tostring(sent[6]))
@@ -3132,33 +3163,8 @@ function VTermPlugin:_runToolbarSuite()
         return "sgr ok n=" .. #sent
     end)
 
-    -- TB34 会话编辑器链路: 打开→模拟键盘改名→getText(与 保存连接 的 collect 同源)
-    -- (mgr 层 update/save 已真机实证正常; 放在 SGR 之后, 编辑器 UI 开关会干扰
-    --  其前的 view/geometry 类断言)
-    check("TB34 会话编辑器改名 getText", function()
-        local sm = self.session_mgr
-        local sessions = sm:list()
-        local idx
-        for i, s in ipairs(sessions) do
-            if s.type == "ssh" then idx = i break end
-        end
-        assert(idx, "无 ssh 会话")
-        self:showSessionEditor(sessions[idx], idx)
-        local ed
-        for _, e in ipairs(UIManager._window_stack or {}) do
-            local w2 = e.widget
-            if w2 and w2.input_fields then ed = w2 end
-        end
-        assert(ed, "编辑器未打开")
-        ed.input_fields[1]:delAll()
-        ed.input_fields[1]:addChars("RENAMED_EDITOR")
-        self:_suiteLog("TB34 editor-getText=" .. tostring(ed.input_fields[1]:getText()))
-        local vals = ed:getFields()
-        self:_suiteLog("TB34 collect-name=" .. tostring(vals[1]) .. " host=" .. tostring(vals[2]))
-        assert(vals[1] == "RENAMED_EDITOR", "collect 应取到新名: " .. tostring(vals[1]))
-        pcall(function() ed:onClose() end)
-        return "diag-done"
-    end)
+    -- TB34 会话编辑器链路: 已下线——编辑器 getText/collect/update 全链路
+    -- 已真机两次实证通过; 且真机套件里开 MultiInputDialog 会挂起设备。
 
     at(1.2, function()
         self:_suiteLog("TOOLBAR SUITE DONE")
@@ -3169,7 +3175,114 @@ function VTermPlugin:_runToolbarSuite()
         end)
         self:_suiteLog("SHOT " .. (ok and "OK" or "FAIL"))
         -- 套件跑完自动退出, 便于无人值守(模拟器/真机)
-        UIManager:scheduleIn(8, function() self:closeTerminal() end)
+        UIManager:scheduleIn(20, function() self:closeTerminal() end)
+    end)
+
+    -- TB35 vim 触摸鼠标 E2E: 真实 vim(mouse=a) → 真实 DECSET 跟踪 → 触摸→SGR
+    -- (放在 TB30 字号/收放实验之后, 避免重建竞态; 用 sendBytes 直发启动命令
+    --  绕过 addChars 沙箱, 排除打字路径干扰)
+    UIManager:scheduleIn(11.5, function()
+        if not self.view or not self.dialog then return end
+        pcall(function()
+            self.view:sendBytes("seq 1 20 > /tmp/vt35.txt\r")
+            self.view:sendBytes("vim /tmp/vt35.txt\r")
+        end)
+    end)
+    UIManager:scheduleIn(14.0, function()
+        if not self.view or not self.dialog then
+            self:_suiteLog("TB35 no-view skip")
+            return
+        end
+        local v = self.view
+        self:_suiteLog("TB35 state: pty=" .. tostring(v.pty ~= nil)
+            .. " click=" .. tostring(v.pty and v.pty.mouse_click)
+            .. " drag=" .. tostring(v.pty and v.pty.mouse_drag)
+            .. " la=" .. tostring(v.pty and v.pty.line_active))
+        if not (v.pty and v.pty.mouse_drag) then
+            -- vim 未开: 再直发一次(排除启动竞态)
+            pcall(function() v:sendBytes("vim /tmp/vt35.txt\r") end)
+        end
+    end)
+    UIManager:scheduleIn(16.0, function()
+        if not self.view or not self.dialog then
+            self:_suiteLog("TB35 no-view skip2")
+            return
+        end
+        local ok, err = pcall(function()
+            local v = self.view
+            -- vim 启动后经真实读侧 DECSET 跟踪开启鼠标模式
+            assert(v.pty.mouse_drag == true, "vim 未开启 1002 拖动跟踪")
+            local sent = {}
+            local orig = v.sendBytes
+            v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+            local r = v:_gridRegion()
+            local c = Geom:new{
+                x = r.x + 4 * v.cell_w + math.floor(v.cell_w / 2),
+                y = r.y + v.cell_h + math.floor(v.cell_h / 2),
+                w = 1, h = 1,
+            }
+            v:onTapTextBox(nil, { pos = c })     -- tap = 点击(按下+释放)
+            v.sendBytes = orig
+            -- 新语义: tap 处按下+释放 = 2 发
+            assert(sent[1] and sent[1]:match("\27%[<0;5;2M$"),
+                "点击 SGR 错: " .. tostring(sent[1]))
+            assert(sent[2] and sent[2]:match("\27%[<0;5;2m$"), "释放缺失")
+            assert(sent[1] and sent[1]:match("\27%[<0;5;2M$"),
+                "点击 SGR 错: " .. tostring(sent[1]))
+            assert(sent[2] and sent[2]:match("\27%[<0;5;2m$"), "释放缺失")
+            self:_suiteLog("TB35 vim-mouse SGR ok: " .. table.concat(sent, " "))
+        end)
+        if not ok then self:_suiteLog("TB35 ERROR: " .. tostring(err)) end
+        -- 拖选(pan 建立按下 + motion + 抬起) → vim VISUAL 选区 → 截图留证
+        pcall(function()
+            local v = self.view
+            local r = v:_gridRegion()
+            local c1 = Geom:new{ x = r.x + 2 * v.cell_w, y = r.y + 2 * v.cell_h + math.floor(v.cell_h / 2), w = 1, h = 1 }
+            local c2 = Geom:new{ x = r.x + 30 * v.cell_w, y = r.y + 9 * v.cell_h + math.floor(v.cell_h / 2), w = 1, h = 1 }
+            v:onVTermPan(nil, { pos = c1 })  -- 按下(建立 _vt_mouse_down)
+            v:onVTermPan(nil, { pos = c2 })  -- motion 拖动
+            v:onVTermPanRelease(nil, {})     -- 抬起(此时仍 VISUAL: vim 拖选后保持模式)
+            self:_suiteLog("TB35 drag done")
+        end)
+    end)
+    UIManager:scheduleIn(17.5, function()
+        if not self.view then return end
+        pcall(function()
+            require("device").screen:shot(self.path .. "/vt_visual_shot.png")
+        end)
+        self:_suiteLog("TB35 visual shot ok")
+    end)
+    UIManager:scheduleIn(19.0, function()
+        if not self.view then return end
+        pcall(function()
+            self.view:sendBytes("\27")    -- 退出 VISUAL
+            self.view:sendBytes("\27:q!\r")
+        end)
+    end)
+    -- TB36 vim 退出后翻历史页 → 网格变黑复现: 背景色直方图 dump + 截图
+    UIManager:scheduleIn(20.5, function()
+        if not self.view then return end
+        pcall(function()
+            local v = self.view
+            v._vt_bg_hist = {}
+            v._vt_arrows = false
+            v._vt_sb_mode = true
+            v:_ensureLive()
+            for _ = 1, 3 do v._vt_sb:scrollUp(1) end
+            v:queueDirty(Geom:new{ x = v.dimen.x, y = v.dimen.y, w = v.dimen.w, h = v.dimen.h })
+        end)
+    end)
+    UIManager:scheduleIn(22.0, function()
+        if not self.view then return end
+        pcall(function()
+            require("device").screen:shot(self.path .. "/vt_hist_shot.png")
+        end)
+        local hist = self.view and self.view._vt_bg_hist
+        if hist then
+            for k, n in pairs(hist) do self:_suiteLog("TB36 bg-hist " .. k .. " = " .. n) end
+            if not next(hist) then self:_suiteLog("TB36 bg-hist EMPTY(无非默认背景)") end
+        end
+        self:_suiteLog("TB36 hist shot done")
     end)
 
     -- TB30 探针(DONE 截图后、closeTerminal 前): 用户实测字号12收键盘顶部越界

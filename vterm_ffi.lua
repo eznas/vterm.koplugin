@@ -101,26 +101,20 @@ void vterm_bridge_set_callbacks(VTermScreen *screen, VTermBridgeCallbacks *bridg
 local VTermFFI = {}
 
 function VTermFFI.load(plugin_dir)
-    local so_path
+    -- ARM 设备优先:两套 .so 会同时随插件分发,文件存在不代表本机能加载,
+    -- ARM .so 在模拟器(x86_64)上必然加载失败,自然回落 x86_64。
     if plugin_dir then
-        local test_x86 = plugin_dir .. "/lib/x86_64/libvterm.so"
-        local test_arm = plugin_dir .. "/lib/armv7_softfp/libvterm.so"
-        local f = io.open(test_x86, "r")
-        if f then
-            f:close()
-            so_path = test_x86
-        else
-            so_path = test_arm
+        local ok, lib = pcall(ffi.load, plugin_dir .. "/lib/armv7_softfp/libvterm.so")
+        if ok then
+            return lib
         end
-    else
-        so_path = "./lib/x86_64/libvterm.so"
+        return ffi.load(plugin_dir .. "/lib/x86_64/libvterm.so")
     end
-
-    local ok, lib = pcall(ffi.load, so_path)
-    if not ok then
-        lib = ffi.load("./lib/x86_64/libvterm.so")
+    local ok, lib = pcall(ffi.load, "./lib/armv7_softfp/libvterm.so")
+    if ok then
+        return lib
     end
-    return lib
+    return ffi.load("./lib/x86_64/libvterm.so")
 end
 
 function VTermFFI.newTerminal(lib, rows, cols)

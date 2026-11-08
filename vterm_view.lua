@@ -23,12 +23,14 @@ WrappedFunction,覆盖即崩)。因此 VTermView 的 addChars/delChar 一律只�
 ]]
 
 local Blitbuffer = require("ffi/blitbuffer")
+local bit = require("bit")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local InputText = require("ui/widget/inputtext")
 local RenderText = require("ui/rendertext")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
+local time = require("ui/time")
 local ffi = require("ffi")
 local util = require("util")
 
@@ -63,8 +65,13 @@ local VTermView = InputText:extend{
     _vt_sb_mode = false,   -- ⇕ 翻页层: true=上下滑发 PgUp/PgDn(⇆关)/翻本地历史(⇆开)
     _vt_page_dir = nil,    -- ⇆关: 本次拖动已处理的翻页方向(pan 流与收尾 swipe 去重)
     _vt_arrows = false,    -- 方向手势开关: true=网格上滑动发方向键
+    _vt_shift_mode = false,-- Shift 挂起状态缓存(跨键盘收起/全屏持久化)
     _vt_arrow_ges = nil,   -- 已注册的手势对象(关闭时摘除)
     STABLE_PX = 12,        -- 手指停住判定阈值(px): 位移小于此视为抖动, 不重置停顿计时
+    SWIPE_UNIT = 120,      -- 同向拖动累计多少像素才发一发(防误触/刷屏; 约两行字高)
+    REPEAT_DELAY = 1.0,    -- 停住满多少秒开始连发
+    REPEAT_PERIOD = 0.2,   -- 连发周期(秒): 5 次/秒(用户定稿)
+    REPEAT_MOVE_PX = 80,   -- 连发期间判"真移动"的步长门槛(px): 小于此的抖动不打断连发
     _vt_collapsed = false, -- ⌨ 收起态(按钮栏+软键盘全收): tap 网格唤回
     _vt_toggle_cb = nil,   -- main.lua 注入的收放切换回调
     _vt_extra_h = 0,       -- 收起手术后额外占位高度(原按钮栏空间, 网格扩展区)
@@ -217,9 +224,86 @@ function VTermView:_syncImeWrapper(new_layout)
     self:refreshInputBar()
 end
 
+-- ==================== 触摸鼠标(SGR 序列翻译) ====================
+-- 应用(vim mouse=a 等)开启 DECSET 鼠标上报后(pty.lua 跟踪), 触摸手势
+-- 翻译成 SGR 鼠标序列: tap=点击(移动光标), 拖动=按住移动, 上下滑=滚轮。
+-- ⚠️⇆ 开启时滑动让位普通键(方向/PgUp/PgDn/Shift+翻页), 鼠标只保留 tap
+-- 点击——滑动被鼠标滚轮/拖动抢占是冲突, 用户定稿 2026-11-08。
+
+function VTermView:_mouseActive()
+    return self.pty and (self.pty.mouse_click or self.pty.mouse_drag) and true or false
+end
+
+-- 屏幕坐标 → 1-based 网格单元格(SGR 鼠标坐标)
+function VTermView:_mouseCell(pos)
+    local off = self._inner_off
+    local col = math.floor((pos.x - self.dimen.x - off) / self.cell_w) + 1
+    local row = math.floor((pos.y - self.dimen.y - off) / self.cell_h) + 1
+    col = math.max(1, math.min(self.cols, col))
+    row = math.max(1, math.min(self.rows, row))
+    return { col = col, row = row }
+end
+
+function VTermView:_mouseSend(btn, pressed, cell)
+    if not cell then return end
+    if self.pty and self.pty.mouse_sgr then
+        -- SGR 格式(应用开了 ?1006)
+        self:sendBytes(string.format("\27[<%d;%d;%d%s", btn, cell.col, cell.row, pressed and "M" or "m"))
+    else
+        -- X10 兜底(远端旧 vim 只开 ?1000/?1002): ESC[M 前缀 + 单字节编码,
+        -- 坐标 +32 偏移, 释放=btn+3; 网格远小于 223, 不会撞 255 哨兵
+        self:sendBytes(string.format("\27[M%c%c%c",
+            btn + (pressed and 32 or 35), cell.col + 32, cell.row + 32))
+    end
+end
+
+-- ANSI 16 色的近似亮度(xterm 默认色板, e-ink 灰阶映射用)
+local _ANSI16_LUM = { 0, 61, 121, 182, 22, 84, 143, 205, 85, 76, 149, 226, 28, 104, 178, 255 }
+local _CUBE_LV = { 0, 95, 135, 175, 215, 255 }
+
+-- indexed 色 → 亮度(xterm 256 色板: 0-15 标准, 16-231 6x6x6 立方, 232-255 灰阶)
+local function indexedLum(idx)
+    if idx >= 232 and idx <= 255 then
+        return 8 + (idx - 232) * 10
+    elseif idx < 16 then
+        return _ANSI16_LUM[idx] or 0
+    end
+    local i = idx - 16
+    local lv = _CUBE_LV
+    return math.floor((lv[math.floor(i / 36) + 1] * 30
+        + lv[math.floor((i % 36) / 6) + 1] * 59
+        + lv[i % 6 + 1] * 11) / 100)
+end
+
+-- cell 背景色 → e-ink 灰阶 Color8(无背景返回 nil)。
+-- 位定义(libvterm vterm.h): TYPE_MASK=0x01(0=RGB,1=INDEXED),
+-- DEFAULT_FG=0x02, DEFAULT_BG=0x04。
+-- ⚠️ 深色背景(亮度<100)不画: libvterm 默认 pen 的 bg = RGB(0,0,0) 黑
+-- (vterm 库暗色终端约定, state.c:163), vim 历史行的格子都带这种 RGB 黑
+-- 背景 → 按亮度渲染会把整屏历史涂黑(真机黑屏实证)。
+-- 本地 vim VISUAL 选区 = indexed 248; 远端 vim 选区色可能是任意 indexed
+-- (含 reverse), 只要有浅色背景就渲染灰底黑字。
+function VTermView:_cellBgGray(cell)
+    local bg = cell.bg
+    if not bg then return nil end
+    local t = bg.type
+    if bit.band(t, 0x04) ~= 0 then return nil end -- DEFAULT_BG: 不画背景
+    if bit.band(t, 0x01) == 0x01 then -- INDEXED
+        local lum = indexedLum(bg.indexed.idx)
+        -- indexed 深色是应用有意的深色高亮(远端 vim Visual 选区 ctermbg=238
+        -- 等, 属性探针实证), e-ink 上黑底黑字无法分辨 → 重映射浅灰底黑字
+        if lum < 100 then return Blitbuffer.Color8(180) end
+        return Blitbuffer.Color8(lum)
+    end
+    local lum = math.floor((bg.rgb.red * 30 + bg.rgb.green * 59 + bg.rgb.blue * 11) / 100)
+    if lum < 100 then return nil end -- RGB 深色 = 库默认黑 pen(state.c:163), 不画防全屏涂黑
+    return Blitbuffer.Color8(lum)
+end
+
 -- 防止点击终端画布时原生 InputText 移动单行光标;
 -- 收起状态(⌨ 把按钮栏+软键盘全收)下 tap 网格 = 唤回(重建路径, 走 main 注入的回调),
 -- 唤回前先滚回实时帧(翻看态下打字, shell 回显会被历史帧遮住)。
+-- 鼠标模式: tap = 抬起(按下由 touch 发) → vim 收到完整点击(移动光标/选词)。
 function VTermView:onTapTextBox(arg, ges)
     self:_gesLog("TAP collapsed=" .. tostring(self._vt_collapsed)
         .. " pos=" .. tostring(ges.pos and (ges.pos.x .. "," .. ges.pos.y) or "nil"))
@@ -227,6 +311,19 @@ function VTermView:onTapTextBox(arg, ges)
         self:_ensureLive()
         self._vt_toggle_cb()
         return true
+    end
+    -- 鼠标模式点击: touch 事件 pos=nil(真机 ges.log 实证) → _vt_mouse_down
+    -- 不会经 onVTermTouch 建立, tap 自带完整坐标 → 在 tap 处直接按下+释放
+    if self:_mouseActive() and ges.pos and not self._vt_collapsed then
+        local r = self:_gridRegion()
+        if r:contains(ges.pos) then
+            self:_ensureLive()
+            local cell = self:_mouseCell(ges.pos)
+            self:_mouseSend(0, true, cell)
+            self:_mouseSend(0, false, cell)
+            self._vt_mouse_down = nil
+            return true
+        end
     end
     return true
 end
@@ -671,6 +768,7 @@ function VTermView:setArrowGestures(enable)
                     if r then
                         if gs.pos and r:contains(gs.pos) then hit = true end
                         if not hit and gs.start_pos and r:contains(gs.start_pos) then hit = true end
+                        if not hit and gs.end_pos and r:contains(gs.end_pos) then hit = true end
                     end
                     if gs.pos then pos_s = gs.pos.x .. "," .. gs.pos.y end
                     if gs.start_pos then start_s = gs.start_pos.x .. "," .. gs.start_pos.y end
@@ -681,16 +779,22 @@ function VTermView:setArrowGestures(enable)
             end,
         }
     end
+    -- release 类事件只按名字匹配, 不做网格判定: 终止信号不是方向载体,
+    -- 下滑收尾时手指常已落在网格外(键盘区), 挂网格 matcher 会被丢弃 →
+    -- 状态机没人叫停 → 1 秒后误连发(真机 SEND 洪流实证 2026-11-08)。
+    local function release_matcher(ges_name)
+        return { ges = ges_name, match = function(_, gs) return gs.ges == ges_name end }
+    end
     if self._vt_arrows then
         self.ges_events.VTermSwipe = { grid_matcher("swipe") }
         self.ges_events.VTermHoldPan = { grid_matcher("hold_pan") }
         -- 单指松手事件名是 hold_release(hold_pan 抬指时必发);
         -- hold_pan_release 是双指变体(two_finger_hold_pan)的释放名, 用错会松手不停
-        self.ges_events.VTermHoldPanRelease = { grid_matcher("hold_release") }
+        self.ges_events.VTermHoldPanRelease = { release_matcher("hold_release") }
         -- 慢速拖动 = pan(快速甩动才是 swipe): 墨水屏上用户滑动普遍偏慢,
         -- 不注册 pan 则慢滑完全无反应。pan 是连续事件, 走 hold_pan 同款节流。
         self.ges_events.VTermPan = { grid_matcher("pan") }
-        self.ges_events.VTermPanRelease = { grid_matcher("pan_release") }
+        self.ges_events.VTermPanRelease = { release_matcher("pan_release") }
         -- touch(手指按下, 不限位置): 任何新触摸=旧滑动会话死亡——滑完去键盘打字,
         -- 停顿计时不作废会在打字中到期误连发(touch 是手势结束的兜底信号,
         -- 快速抬起的 pan 流可能既没有 pan_release 也没有 swipe)。
@@ -705,7 +809,7 @@ function VTermView:setArrowGestures(enable)
         self._vt_page_dir = nil
         self.ges_events.VTermSwipe = { grid_matcher("swipe") }
         self.ges_events.VTermPan = { grid_matcher("pan") }
-        self.ges_events.VTermPanRelease = { grid_matcher("pan_release") }
+        self.ges_events.VTermPanRelease = { release_matcher("pan_release") }
         self.ges_events.VTermTouch = {
             { ges = "touch", match = function(_, gs) return gs.ges == "touch" end },
         }
@@ -741,6 +845,14 @@ function VTermView:_ensureLive()
     end
 end
 
+-- Shift 挂起状态判据: 软键盘展开时跟随 keyboard.shiftmode, 键盘收起/全屏时保持 _vt_shift_mode 缓存
+function VTermView:_hasShift()
+    if not self._vt_collapsed and self.keyboard then
+        self._vt_shift_mode = self.keyboard.shiftmode and true or false
+    end
+    return self._vt_shift_mode or (self.keyboard and self.keyboard.shiftmode) or false
+end
+
 -- ⇆(方向手势)关闭时, 上下滑 = PuTTY 式三级阶梯(定稿):
 --   ⇆关 + ⇕关 → ↑/↓ 方向键(逐行);
 --   ⇆关 + ⇕开 → 远端 PageUp/PageDown(\27[5~/6~);
@@ -760,7 +872,7 @@ function VTermView:_pageAction(direction)
         return function()
             self:_ensureLive()
             local mod = ""
-            if self.keyboard and self.keyboard.shiftmode then mod = ";2" end
+            if self:_hasShift() then mod = ";2" end
             self:sendBytes(is_up and ("\27[5" .. mod .. "~") or ("\27[6" .. mod .. "~"))
         end
     end
@@ -790,10 +902,20 @@ function VTermView:_vtAction(direction)
     if not direction then return nil end
     local is_up = direction:find("north", 1, true) or direction:find("up", 1, true)
     local is_down = direction:find("south", 1, true) or direction:find("down", 1, true)
-    if (is_up or is_down) and self._vt_sb_mode and self._vt_sb then
-        local page = math.max(1, self.rows - 1) -- 少留一行衔接上下文
-        return function()
-            if is_up then self:scrollUp(nil, page) else self:scrollDown(nil, page) end
+    if is_up or is_down then
+        -- 左右滑动使能后: Shift 挂起 + 上/下滑 = PageUp/PageDown(\27[5~ / \27[6~)
+        if self:_hasShift() then
+            local seq = is_up and "\27[5~" or "\27[6~"
+            return function()
+                self:_ensureLive()
+                self:sendBytes(seq)
+            end
+        end
+        if self._vt_sb_mode and self._vt_sb then
+            local page = math.max(1, self.rows - 1) -- 少留一行衔接上下文
+            return function()
+                if is_up then self:scrollUp(nil, page) else self:scrollDown(nil, page) end
+            end
         end
     end
     local seq = self:_arrowSeq(direction)
@@ -813,6 +935,25 @@ end
 
 function VTermView:onVTermSwipe(_, ges)
     self:_gesLog("SWIPE dir=" .. tostring(ges.direction) .. " arrows=" .. tostring(self._vt_arrows))
+    -- 鼠标模式(⇆ 关): 拖动未完=抬起收尾; 否则上下滑=滚轮(vim 滚屏)。
+    -- ⇆ 开: 滑动归普通键(方向/翻页), 不做鼠标
+    if self:_mouseActive() and not self._vt_arrows then
+        if self._vt_mouse_down then
+            self:_mouseSend(0, false, self._vt_mouse_down)
+            self._vt_mouse_down = nil
+            return true
+        end
+        local d = ges.direction or ""
+        local cell = ges.pos and self:_mouseCell(ges.pos)
+        if d:find("north", 1, true) then
+            for _ = 1, 3 do self:_mouseSend(64, true, cell) end -- 滚轮上×3
+            return true
+        elseif d:find("south", 1, true) then
+            for _ = 1, 3 do self:_mouseSend(65, true, cell) end -- 滚轮下×3
+            return true
+        end
+        return true -- 鼠标模式下左右滑不做事
+    end
     -- ⇆ 关闭时上下滑=↑/↓(⇕关) 或 PgUp/PgDn(⇕开), 一次滑动一发, 其余方向不消费。
     -- pan 流(慢速拖动)可能已经发过本手势的一发: _vt_page_dir 去重, 收尾不补发。
     if not self._vt_arrows then
@@ -837,6 +978,27 @@ end
 
 function VTermView:onVTermHoldPan(_, ges)
     self:_gesLog("HOLDPAN dir=" .. tostring(ges.direction) .. " cur=" .. tostring(self._vt_arrow_dir))
+    -- 连发存活判据的时间源: 只要 pan 事件还在来(含静止噪声)就证明手指还在。
+    -- ⚠️fts 微秒值, 时钟回调里与 time.s() 比较
+    self._vt_last_ges_fts = time.now()
+    -- 鼠标模式(⇆ 关): 按住移动 = button-1 motion(拖动选区/滚动)。首个
+    -- hold_pan 处建立按下状态(touch 无 pos, _vt_mouse_down 只能在这里初始化)
+    if self:_mouseActive() and not self._vt_arrows and ges.pos and not self._vt_collapsed then
+        local p = ges.pos
+        local grid = self:_gridRegion()
+        if p and grid and grid:contains(p) and self.pty.mouse_drag then
+            local cell = self:_mouseCell(p)
+            if not self._vt_mouse_down then
+                self._vt_mouse_down = cell
+                self:_mouseSend(0, true, cell)
+            end
+            if cell.col ~= self._vt_mouse_down.col or cell.row ~= self._vt_mouse_down.row then
+                self:_mouseSend(32, true, cell)
+                self._vt_mouse_down = cell
+            end
+        end
+        return true
+    end
     if not self._vt_arrows then
         -- ⇆ 关: 慢速拖动也只发一发(↑/↓ 或 PgUp/PgDn), 不做连发/换向状态机
         return self:_pagePan(ges)
@@ -857,28 +1019,146 @@ function VTermView:onVTermHoldPan(_, ges)
         self:_stopArrowRepeat()
         return true
     end
+
+    -- 连发已在进行中: 只要手指在网格内且未明确换向, 忽略一切细微抖动, 保持连续触发
+    if self._vt_repeat_task then
+        if dir and dir ~= self._vt_arrow_dir then
+            -- 明确换向: 立即发一次新方向, 并在新方向重启连发
+            self:_stopArrowRepeat()
+            self._vt_arrow_dir = dir
+            self._vt_pan_acc = 0
+            self._vt_last_send_t = time.now()
+            act()
+            self._vt_still_since = time.now()
+            self:_startRepeatClock()
+        end
+        if p then self._vt_last_pan_pos = { x = p.x, y = p.y } end
+        return true
+    end
+
     local moved = true
     if p and self._vt_last_pan_pos then
         local dx = p.x - self._vt_last_pan_pos.x
         local dy = p.y - self._vt_last_pan_pos.y
-        moved = (dx * dx + dy * dy) >= self.STABLE_PX * self.STABLE_PX
+        local d2 = dx * dx + dy * dy
+        moved = d2 >= self.STABLE_PX * self.STABLE_PX
+        -- 位移累加: 手指持续移动时只累积不触发(防连续滑动刷屏/误触),
+        -- 累计够 SWIPE_UNIT 像素才发一发并清零
+        if moved then
+            self._vt_pan_acc = (self._vt_pan_acc or 0) + math.sqrt(d2)
+        end
     end
     if p then self._vt_last_pan_pos = { x = p.x, y = p.y } end
     if moved then
         if dir ~= self._vt_arrow_dir then
-            -- 滑动/换向: 只发一次方向键(拖动中同向不再发)
+            -- 换向: 立即发一次(用户明确改变方向), 累加器清零
             self:_stopArrowRepeat()
             self._vt_arrow_dir = dir
+            self._vt_pan_acc = 0
+            self._vt_last_send_t = time.now()
+            act()
+        elseif (self._vt_pan_acc or 0) >= self.SWIPE_UNIT then
+            -- 同向持续拖动累计够一段距离: 发一发, 清零继续累积
+            self._vt_pan_acc = 0
+            self._vt_last_send_t = time.now()
             act()
         end
-        -- 真移动重置停顿计时; 停住(抖动)让 1s 计时照常走完 → 连发
-        self:_armHoldRepeat()
+        -- 真移动: 停连发时钟, 停顿计时从这里重新起算
+        self._vt_still_since = nil
+        self:_stopRepeatClock()
+    else
+        -- 停住: 只负责"起算停住起点", 真正的连发交给固定节拍定时器
+        -- (`_startRepeatClock`)。不在这里每事件发键——事件到达频率不均匀,
+        -- 由它驱动会导致连发忽快忽慢、手抖大位移还会额外跳格(用户实测)。
+        if not self._vt_still_since and not self._vt_repeat_task then
+            self._vt_still_since = time.now()
+            self:_startRepeatClock()
+        end
     end
     return true
 end
 
+-- 固定节拍连发: 停住满 REPEAT_DELAY 秒后, 每 REPEAT_PERIOD 秒发一发,
+-- 直到 `_stopRepeatClock()`(抬起/换向/移动/滑出网格)。
+-- ⚠️⚠️time.now() 返回的是 fts 定点**微秒**值, 不是普通秒! 所有秒数必须经
+-- time.s() 换算再比较/相加; 普通数字直接当 fts 用 = "1.0"=1 微秒 → 判据
+-- 恒真 → 暴涨连发(设备实测 2 秒 200+ 发)。scheduleIn 收的则是**秒**(float)。
+function VTermView:_startRepeatClock()
+    if self._vt_repeat_task then return end
+    -- 记录连发方向的单位向量: 停住期间噪声位移用它判"是否转向"
+    local seq = self:_arrowSeq(self._vt_arrow_dir)
+    self._vt_rep_dir_v = seq == "\27[A" and { x = 0, y = -1 }
+        or seq == "\27[B" and { x = 0, y = 1 }
+        or seq == "\27[C" and { x = 1, y = 0 }
+        or { x = -1, y = 0 }
+    local base = self._vt_still_since or time.now()
+    -- 时钟实例代号: 只有当前代号的任务才允许继续排下一拍。
+    -- ⚠️不能只靠 _vt_repeat_task ~= nil 互斥——回调里先置 nil 再重排,
+    -- 中间若来 pan 噪声事件会再启一个时钟 → 多时钟并行。
+    local tok = (self._vt_repeat_tok or 0) + 1
+    self._vt_repeat_tok = tok
+    local delay_fts = time.s(self.REPEAT_DELAY)
+    local period_fts = time.s(self.REPEAT_PERIOD)
+    local fn
+    fn = function()
+        if self._vt_repeat_tok ~= tok then return end -- 已被停止/取代
+        if not self._vt_arrows or not self._vt_arrow_dir then return end
+
+        -- 抬手检测(首行守卫): 真机抬手后 release 事件可能整体丢失,
+        -- 静默超过 0.5s 说明手指已不在屏幕上, 立即自杀叫停连发
+        local since_ges = time.now() - (self._vt_last_ges_fts or 0)
+        if since_ges > time.s(0.5) then
+            self:_stopArrowRepeat()
+            return
+        end
+
+        local elapsed = time.now() - base
+        if elapsed < delay_fts then
+            self._vt_repeat_task = fn
+            UIManager:scheduleIn(time.to_s(delay_fts - elapsed), fn)
+            return
+        end
+        local dir = self._vt_arrow_dir
+        -- 硬节流: 无论存在几个时钟实例, 距上次真实发送 < 周期×0.8 一律不发
+        -- (代字号防线失效时的最后保险, 保证设备实测速率不超 REPEAT_PERIOD)
+        local since_send = time.now() - (self._vt_last_send_t or time.huge)
+        if since_send < period_fts * 0.8 then
+            self._vt_repeat_task = fn
+            UIManager:scheduleIn(self.REPEAT_PERIOD, fn)
+            return
+        end
+        local rep = self:_vtAction(dir)
+        if rep then rep() end
+        self._vt_last_send_t = time.now()
+        -- 下一拍按"起点 + n×周期"对齐, 漂移不累积
+        self._vt_repeat_n = (self._vt_repeat_n or 0) + 1
+        local wait_fts = base + delay_fts
+            + self._vt_repeat_n * period_fts - time.now()
+        if wait_fts < time.us(5000) then wait_fts = time.us(5000) end
+        self._vt_repeat_task = fn
+        UIManager:scheduleIn(time.to_s(wait_fts), fn)
+    end
+    self._vt_repeat_task = fn
+    UIManager:scheduleIn(self.REPEAT_DELAY, fn)
+end
+
+function VTermView:_stopRepeatClock()
+    self._vt_repeat_n = 0
+    self._vt_repeat_tok = (self._vt_repeat_tok or 0) + 1 -- 作废在跑的所有时钟
+    if self._vt_repeat_task then
+        UIManager:unschedule(self._vt_repeat_task)
+        self._vt_repeat_task = nil
+    end
+end
+
 function VTermView:onVTermHoldPanRelease(_, ges)
     self:_gesLog("RELEASE")
+    -- 鼠标模式: 拖动结束 = 抬起
+    if self:_mouseActive() and self._vt_mouse_down then
+        self:_mouseSend(0, false, self._vt_mouse_down)
+        self._vt_mouse_down = nil
+        return true
+    end
     self:_stopArrowRepeat()
     self._vt_page_dir = nil -- ⇆关: 手势结束, 下次拖动重新计
     self._vt_last_pan_pos = nil -- 位置基准清零, 下次拖动重新建立
@@ -889,7 +1169,17 @@ end
 -- 不消费(return false), touch 继续正常路由给键盘等 widget。
 function VTermView:onVTermTouch(_, ges)
     self._vt_page_dir = nil -- 新触摸=上一次拖动会话结束(⇆关翻页去重标记)
-    if self._vt_arrow_dir or self._vt_arrow_fn or self._vt_last_pan_pos then
+    -- 鼠标模式(⇆ 关): 网格内按下 = button-1 press(vim 收到即跟随光标)。
+    -- ⇆ 开: 不发 press——滑动已让位普通键, 按下会残留拖拽态
+    if self:_mouseActive() and not self._vt_arrows and not self._vt_collapsed and ges.pos then
+        local r = self:_gridRegion()
+        if r:contains(ges.pos) then
+            self:_ensureLive()
+            self._vt_mouse_down = self:_mouseCell(ges.pos)
+            self:_mouseSend(0, true, self._vt_mouse_down)
+        end
+    end
+    if self._vt_arrow_dir or self._vt_repeat_task or self._vt_last_pan_pos then
         self:_gesLog("TOUCH-reset")
         self:_stopArrowRepeat()
         self._vt_last_pan_pos = nil
@@ -897,50 +1187,24 @@ function VTermView:onVTermTouch(_, ges)
     return false
 end
 
--- 慢速拖动(pan)与长按拖动(hold_pan)同语义: 滑动触发模型(见 _armHoldRepeat)
+-- 慢速拖动(pan)与长按拖动(hold_pan)同语义: 滑动触发模型(见 _startRepeatClock)
 VTermView.onVTermPan = VTermView.onVTermHoldPan
 VTermView.onVTermPanRelease = VTermView.onVTermHoldPanRelease
 
--- 滑动触发模型(用户定稿):
---   一次滑动/换向 → 只发一次方向键(拖动中同向不发);
---   手指停在原地(手势事件流静默)满 1 秒 → 开始连发(0.12s 节奏, 原 0.35 的约 3 倍频率);
---   手指抬起 → 立即停(unschedule 硬取消连发, 停顿计时作废)。
+-- 滑动触发模型(用户定稿 2026-11-08 事件驱动版):
+--   一次滑动/换向 → 立即发一次; 同向拖动累计满 SWIPE_UNIT 才再发(防误触);
+--   手指停在原地满 1 秒 → 0.12s 节奏连发(在 pan 事件回调里判定, 不依赖定时器);
+--   手指抬起 → 立即停。
+-- ⚠️弃用 UIManager:scheduleIn 连发: 设备上手指按住时主循环阻塞等输入,
+-- 定时器到期不执行(实测 REPEAT_START 有、TICK 零), 连发永不启动。
 
--- pan/hold_pan 事件流静默满 1 秒(期间每个新事件都会使上一个计时作废)才开始连发
-function VTermView:_armHoldRepeat()
-    self._vt_hold_seq = (self._vt_hold_seq or 0) + 1
-    local my = self._vt_hold_seq
-    UIManager:scheduleIn(1.0, function()
-        if self._vt_hold_seq ~= my then return end -- 停顿期间有新事件, 不算停住
-        if not self._vt_arrows or not self._vt_arrow_dir then return end
-        if self._vt_arrow_fn then return end -- 已在连发
-        self:_scheduleArrowRepeat()
-    end)
-end
-
-function VTermView:_scheduleArrowRepeat()
-    if self._vt_arrow_fn or not self._vt_arrows or not self._vt_arrow_dir then return end
-    local fn
-    fn = function()
-        self._vt_arrow_fn = nil
-        if not self._vt_arrows or not self._vt_arrow_dir then return end
-        local act = self:_vtAction(self._vt_arrow_dir)
-        if act then act() end
-        self._vt_arrow_fn = fn
-        UIManager:scheduleIn(0.12, fn)
-    end
-    self._vt_arrow_fn = fn
-    UIManager:scheduleIn(0.12, fn)
-end
 
 -- 手指抬起(release)/关开关: 立即停
 function VTermView:_stopArrowRepeat()
-    self._vt_hold_seq = (self._vt_hold_seq or 0) + 1 -- 作废停顿计时
     self._vt_arrow_dir = nil
-    if self._vt_arrow_fn then
-        UIManager:unschedule(self._vt_arrow_fn)
-        self._vt_arrow_fn = nil
-    end
+    self._vt_pan_acc = 0 -- 手势结束: 位移累加清零, 防跨手势残留误发
+    self._vt_still_since = nil -- 停住起点清零(下次按压重新计时)
+    self:_stopRepeatClock()
 end
 
 -- ==================== 渲染与局部刷屏 ====================
@@ -1063,17 +1327,24 @@ function VTermView:paintTo(bb, x, y)
             local c = 0
             while c < self.cols do
                 local cell_r = row_cells[c]
-                local w = tonumber(cell_r.width)
+                local w = tonumber(cell_r.width) or 1
                 local codepoint = cell_r.chars[0]
+                -- 背景(选区灰度/反色)先画: 空格子(chars[0]=0)也画, 否则
+                -- vim VISUAL 选区延伸到行尾空白时高亮"看不出来"
+                local bgc = cell_r.bg and self:_cellBgGray(cell_r)
+                if not bgc and cell_r.attrs.reverse == 1 then
+                    bgc = Blitbuffer.COLOR_BLACK
+                end
+                if bgc then
+                    bb:paintRect(gx + c * cell_w, gy + r * cell_h,
+                        (w > 0 and w or 1) * cell_w, cell_h, bgc)
+                end
                 if w > 0 and codepoint ~= 0 and codepoint ~= 0xFFFFFFFF then
                     local is_cjk = (w == 2)
                     local face = is_cjk and self.face_cjk or self.face_mono
                     local glyph = RenderText:getGlyph(face, codepoint, cell_r.attrs.bold == 1)
                     local px = gx + c * cell_w
                     local py = gy + r * cell_h + baseline
-                    if cell_r.attrs.reverse == 1 then
-                        bb:paintRect(px, gy + r * cell_h, w * cell_w, cell_h, Blitbuffer.COLOR_BLACK)
-                    end
                     local fg = (cell_r.attrs.reverse == 1) and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
                     if glyph and glyph.bb then
                         bb:colorblitFrom(glyph.bb, px + glyph.l, py - glyph.t, 0, 0,
@@ -1092,6 +1363,16 @@ function VTermView:paintTo(bb, x, y)
                 local w = tonumber(cell.width)
                 local codepoint = cell.chars[0]
 
+                -- 背景(选区灰度/反色)先画: 空格子也画(同 row_cells 分支)
+                local bgc = self:_cellBgGray(cell)
+                if not bgc and cell.attrs.reverse == 1 then
+                    bgc = Blitbuffer.COLOR_BLACK
+                end
+                if bgc then
+                    bb:paintRect(gx + c * cell_w, gy + r * cell_h,
+                        (w > 0 and w or 1) * cell_w, cell_h, bgc)
+                end
+
                 if w > 0 and codepoint ~= 0 and codepoint ~= 0xFFFFFFFF then
                     local is_bold = (cell.attrs.bold == 1)
                     local is_cjk = (w == 2)
@@ -1100,10 +1381,6 @@ function VTermView:paintTo(bb, x, y)
 
                     local px = gx + c * cell_w
                     local py = gy + r * cell_h + baseline
-
-                    if cell.attrs.reverse == 1 then
-                        bb:paintRect(px, gy + r * cell_h, w * cell_w, cell_h, Blitbuffer.COLOR_BLACK)
-                    end
 
                     local fg_color = (cell.attrs.reverse == 1) and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
 
@@ -1135,6 +1412,38 @@ function VTermView:paintTo(bb, x, y)
             local cur_x = gx + cur_pos.col * cell_w
             local cur_y = gy + cur_pos.row * cell_h
             bb:invertRect(cur_x, cur_y, cell_w, cell_h)
+        end
+    end
+
+    -- 临时探针: 选区高亮排障(/tmp/vt_attr.on 存在时采样整屏属性分布),
+    -- 统计 reverse/下划线/非默认背景色号, 用完删。必须在条带分支提前
+    -- return(bar_h<=0 / 收起)之前, 否则 EN 布局采样不到。
+    if io.open("/tmp/vt_attr.on", "r") then
+        local n_rev, n_ul, n_bg = 0, 0, 0
+        local bg_seen = {}
+        local pc = ffi.new("VTermPos")
+        for r = 0, self.rows - 1 do
+            pc.row = r
+            for c = 0, self.cols - 1 do
+                pc.col = c
+                vt_lib.vterm_screen_get_cell(screen, pc, cell)
+                if cell.attrs.reverse == 1 then n_rev = n_rev + 1 end
+                if cell.attrs.underline == 1 then n_ul = n_ul + 1 end
+                local t = tonumber(cell.bg.type) or 0
+                if bit.band(t, 0x04) == 0 and bit.band(t, 0x01) ~= 0 then
+                    local idx = tonumber(cell.bg.indexed.idx) or -1
+                    n_bg = n_bg + 1
+                    bg_seen[idx] = (bg_seen[idx] or 0) + 1
+                end
+            end
+        end
+        local parts = {}
+        for idx, n in pairs(bg_seen) do parts[#parts + 1] = idx .. "x" .. n end
+        local lf = io.open("/tmp/vt_attr.log", "a")
+        if lf then
+            lf:write(os.date("%H:%M:%S"), " rev=", n_rev, " ul=", n_ul,
+                " bg=", n_bg, " [", table.concat(parts, ","), "]\n")
+            lf:close()
         end
     end
 

@@ -1,18 +1,17 @@
 --[[--
-本地滚动(Scrollback): 把"滚出屏幕顶部的行"攒进 Lua 侧历史栈, ↑/↓ 改成翻历史。
+本地滚动(Scrollback): 把"滚出屏幕顶部的行"攒进 Lua 侧历史日志, ↑/↓ 改变视口偏移。
 
 登记走官方 pushline4 回调(带 continuation 位, 区分"整行滚出"与"折行续行")。
 这版 libvterm 的整行滚屏虽然走 premove 路径, pushline4 在这些路径上仍逐行触发
 (实测), 因此不需要额外接 moverect。
 
-翻看时把实时屏和翻看屏分开:
-  live —— 跟远端同步的屏幕快照(每帧从 libvterm 读);
-  view —— 往上翻了 offset 行后的画面, 只用于渲染。
-往上翻: 历史栈顶行补到 view 顶, view 顶行压回历史栈顶;
-往下翻: view 顶行入栈, 历史栈顶补到 view 底;
-offset 回到 0 → 直接渲染 live, 实时输出照常滚动。
-libvterm 没有写回格子的 API, 所以重排只在渲染层, 不回灌状态机
-(翻看时远端输出仍进 live, 退出翻看立刻看到最新画面)。
+翻看时:
+  offset = 0: 直接渲染 live 实时屏, 实时输出照常滚动。
+  offset > 0: 虚拟行连续映射:
+    虚拟行 1 .. #lines 为历史行 (1=最旧, #lines=紧邻屏幕顶部)
+    虚拟行 #lines+1 .. #lines+rows 为进入翻看时的 live 屏快照
+    第 row 行显示: 虚拟行 (#lines - offset) + 1 + row
+  下翻/上翻纯按 offset 寻址, 零丢行、零空白洞、不破坏历史栈。
 ]]
 
 local ffi = require("ffi")
@@ -34,10 +33,9 @@ function Scrollback.new(vt_lib, vt, screen, rows, cols, max_lines)
         rows = rows,
         cols = cols,
         max_lines = max_lines or DEFAULT_MAX_LINES,
-        lines = {}, -- 历史: [1 .. #lines], 末尾 = 紧贴屏幕上方的那行
-        mode = "push",
-        offset = 0, -- 往上翻了几行; 0 = 看实时输出
-        view = {},  -- 翻看屏行: view[r] = cells(r 从 0 起)
+        lines = {},    -- 历史日志: [1 .. #lines], 1=最早, 末尾=紧贴屏幕上方的那行
+        offset = 0,    -- 往上翻了几行; 0 = 看实时输出
+        snapshot = nil,-- 翻看时的实时屏快照: [0 .. rows-1]
         _cell = ffi.new("VTermScreenCell"),
         _pos = ffi.new("VTermPos"),
     }, Scrollback)
@@ -57,11 +55,15 @@ function Scrollback:reset(rows, cols)
     self.rows = rows or self.rows
     self.cols = cols or self.cols
     self.lines = {}
-    self.view = {}
+    self.snapshot = nil
     self.offset = 0
 end
 
 function Scrollback:depth()
+    return #self.lines - self.offset
+end
+
+function Scrollback:totalLines()
     return #self.lines
 end
 
@@ -100,63 +102,55 @@ function Scrollback:pushCells(cells)
     return false -- 纯空白行不进历史
 end
 
-function Scrollback:popCells()
-    return table.remove(self.lines)
-end
-
 function Scrollback:_onPushline(cells, continuation)
     local copy = ffi.new("VTermScreenCell[?]", self.cols)
     ffi.copy(copy, cells, ffi.sizeof("VTermScreenCell") * self.cols)
-    self:pushCells(copy)
+    if self:pushCells(copy) then
+        if self.offset > 0 then
+            self.offset = math.min(self.max_lines, self.offset + 1)
+        end
+    end
     return 1
 end
 
 -- ==================== 翻看 ====================
 
--- 把翻看屏初始化成当前实时屏, 再按 offset 调整
-function Scrollback:_loadView()
-    for r = 0, self.rows - 1 do self.view[r] = self:saveRow(r) end
+function Scrollback:_loadSnapshot()
+    self.snapshot = {}
+    for r = 0, self.rows - 1 do self.snapshot[r] = self:saveRow(r) end
 end
 
 -- 往上翻 n 行; 历史取完就到最早一屏停住(返回实际翻了行数)。
--- 屏幕内容整体下移: 底部留空由下一行历史填, 顶行滑出视图顶部
--- (不压回历史栈 —— 否则"上翻→下翻"会把行来回搬运, 永远翻不完)。
 function Scrollback:scrollUp(n)
     n = n or 1
-    if self.offset == 0 then self:_loadView() end
-    local moved = 0
-    for _ = 1, n do
-        local cells = self:popCells()
-        if not cells then break end
-        for r = self.rows - 1, 1, -1 do self.view[r] = self.view[r - 1] end
-        self.view[0] = cells
-        self.offset = self.offset + 1
-        moved = moved + 1
-    end
-    return moved
+    local max_offset = #self.lines
+    if self.offset >= max_offset then return 0 end
+    if self.offset == 0 then self:_loadSnapshot() end
+    local old = self.offset
+    self.offset = math.min(max_offset, self.offset + n)
+    return self.offset - old
 end
 
 -- 往下翻 n 行; 回到 0 就恢复实时输出
 function Scrollback:scrollDown(n)
     n = n or 1
     if self.offset == 0 then return 0 end
-    local moved = 0
-    for _ = 1, n do
-        if self.offset == 0 then break end
-        local top = self.view[0]
-        for r = 0, self.rows - 2 do self.view[r] = self.view[r + 1] end
-        self.view[self.rows - 1] = self:_blankRow()
-        if top then self:pushCells(top) end -- 上翻时取走的历史行原样放回栈顶
-        self.offset = self.offset - 1
-        moved = moved + 1
-        if self.offset == 0 then self.view = {} break end
-    end
-    return moved
+    local old = self.offset
+    self.offset = math.max(0, self.offset - n)
+    if self.offset == 0 then self.snapshot = nil end
+    return old - self.offset
 end
 
--- 渲染层取行: 翻看时取 view, 否则实时屏
+-- 渲染层取行: 翻看时按虚拟坐标取行, 否则实时屏
 function Scrollback:rowCells(row)
-    if self.offset > 0 then return self.view[row] end
+    if self.offset == 0 then return nil end
+    local v = (#self.lines - self.offset) + 1 + row
+    if v >= 1 and v <= #self.lines then
+        return self.lines[v]
+    elseif v > #self.lines and self.snapshot then
+        local snap_idx = v - #self.lines - 1
+        return self.snapshot[snap_idx]
+    end
     return nil
 end
 

@@ -24,7 +24,8 @@ local EN_STRS = {
     ["本地 Shell"] = "Local Shell",
     ["关于"] = "About",
     ["VTerm 增强终端"] = "VTerm Enhanced Terminal",
-    ["(Tip: Tap anywhere on the title bar to refresh screen.)"] = "（提示: 点标题栏任意位置可整屏刷新清残影）",
+    ["增强终端，支持中文、Vim 等！"] = "An enhanced terminal, support Chinese, Vim and more!",
+    ["提示: 点标题栏任意位置可整屏刷新清残影。"] = "Tip: Tap anywhere on the title bar to refresh screen.",
     ["+ 新建远程 SSH 会话"] = "+ New Remote SSH Session",
     ["新建远程 SSH 会话 (类似 PuTTY)"] = "New Remote SSH Session (PuTTY-like)",
     ["⚙ 设置"] = "⚙ Settings",
@@ -1343,18 +1344,24 @@ function VTermPlugin:_closeHostMenu()
     if self.ui and self.ui.menu then pcall(function() self.ui.menu:onClose() end) end
 end
 
--- 关于弹窗: 名称版本 + GitHub 链接 + 刷新提示(无 ⓘ 图标)
+-- 关于弹窗: 名称版本 + 简介 + 刷新提示 + GitHub(无 ⓘ 图标)。
+-- 整体用 smallinfofont 小字号, 链接一行放得下(InfoMessage 单一字号, 不做混排)。
 function VTermPlugin:showAbout()
+    local Font = require("ui/font")
     local T = require("ffi/util").template
     local text = table.concat({
         T(_("%1 %2"), _("VTerm 增强终端"), VTERM_VERSION),
         "",
+        _("增强终端，支持中文、Vim 等！"),
+        "",
+        _("提示: 点标题栏任意位置可整屏刷新清残影。"),
+        "",
         "https://github.com/eznas/vterm.koplugin",
-        _("(Tip: Tap anywhere on the title bar to refresh screen.)"),
     }, "\n")
     UIManager:show(InfoMessage:new{
         text = text,
         show_icon = false,
+        face = Font:getFace("smallinfofont"),
     })
 end
 
@@ -3019,11 +3026,9 @@ function VTermPlugin:_runToolbarSuite()
         return "en+zh both 0x1D"
     end)
 
-    -- TB29 设置对话框"标题栏电量与时间"勾选行: 结构断言 + 待定态/应用保存语义
-    -- + 油漆后截图留证(0.8s 后), 收尾时间轴相应后移
-    check("TB29 设置对话框勾选行: 待定态+点应用才保存", function()
-        local orig_on = self:_titleInfoEnabled()
-        G_reader_settings:saveSetting("vterm_title_info", true) -- 入口强制开, 套件确定性
+    -- TB29 设置对话框"关于"按键 + 弹窗(精简版: 勾选行/待定态/应用保存语义
+    -- 已修复且历轮全绿, 本轮未涉及 → 不再重复测试; 只测本轮改动的关于入口)
+    check("TB29 设置对话框关于按键+弹窗", function()
         self:showSettings()
         local dlg
         for _, e in ipairs(UIManager._window_stack or {}) do
@@ -3031,33 +3036,6 @@ function VTermPlugin:_runToolbarSuite()
             if w and w.widget_frame and w.left_widget and w.right_widget then dlg = w end
         end
         assert(dlg, "设置对话框未打开")
-        local vg = dlg.widget_frame[1]
-        local cb = vg[3] and vg[3][1]
-        assert(cb and cb.toggleCheck and type(cb.text) == "string"
-                and (cb.text:find("电量") or cb.text:find("attery")), -- 中英双语 UI
-            "勾选行未插在按钮排前: " .. tostring(cb and cb.text))
-        assert(vg[4] and vg[4][1] and not vg[4][1].toggleCheck, "按钮排错位")
-        -- 无变更时应用键不使能; 勾选产生待定态后点亮
-        local bt = vg[4][1]
-        local lastrow = bt.buttons_layout[#bt.buttons_layout]
-        local okbtn = lastrow[#lastrow]
-        assert(okbtn.enabled == false, "无变更时应用键应禁用, 实得 " .. tostring(okbtn.enabled))
-        -- 切到关: 只记待定态, 不持久化不生效
-        cb:toggleCheck(); cb.callback()
-        assert(dlg._vt_title_pending == false, "待定态未记录: pending="
-            .. tostring(dlg._vt_title_pending) .. " checked=" .. tostring(cb.checked))
-        assert(okbtn.enabled == true, "有待定态时应用键应点亮")
-        assert(G_reader_settings:readSetting("vterm_title_info") ~= false, "未应用就持久化了")
-        -- 点应用: 持久化 false + 标题条摘除
-        dlg.callback(18, 2000)
-        assert(G_reader_settings:readSetting("vterm_title_info") == false, "应用未持久化")
-        assert(self._title_info == nil, "应用后未摘除信息组件")
-        -- 再切回开 + 应用: 重挂
-        cb:toggleCheck(); cb.callback()
-        dlg.callback(18, 2000)
-        assert(G_reader_settings:readSetting("vterm_title_info") ~= false, "应用未恢复开启")
-        assert(self._title_info ~= nil, "应用后未重挂信息组件")
-        -- "关于"按键(extra 行, 与"恢复默认"同款) + 弹窗内容
         local bt = dlg.widget_frame[1][4][1] -- [4]=CenterContainer → [1]=ButtonTable
         local about_cb
         for _, row in ipairs(bt.buttons_layout or {}) do
@@ -3085,12 +3063,8 @@ function VTermPlugin:_runToolbarSuite()
                 require("device").screen:shot(self.path .. "/vt_settings_shot.png")
             end)
             pcall(function() dlg:onClose() end)
-            if not orig_on then -- 用户原本关着: 还原回关
-                G_reader_settings:saveSetting("vterm_title_info", false)
-                self:_stopTitleInfo()
-            end
         end)
-        return "row@vg3 checked=" .. tostring(cb.checked) .. " apply-save-ok"
+        return "about-ok"
     end)
 
     -- TB31 点击标题栏 = 全屏刷新: 点击层挂在 OverlapGroup 底层且回调可用

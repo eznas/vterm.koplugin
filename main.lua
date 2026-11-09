@@ -3,6 +3,7 @@ local Button = require("ui/widget/button")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
@@ -16,6 +17,7 @@ local VTermFFI = require("vterm_ffi")
 local VTermView = require("vterm_view")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local gettext = require("gettext")
+local time = require("ui/time")
 -- 轻量双语: 文案原文即中文; KOReader 界面语言非 zh* 时自动切英文对照表
 -- (中文走 gettext 原样返回; 每次调用现读语言, 菜单重建即切换, 无需重启)
 local EN_STRS = {
@@ -70,7 +72,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.2.0" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.3.0" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -667,6 +669,106 @@ function VTermPlugin:showSessionEditor(sess, index)
     UIManager:show(dialog)
 end
 
+-- 特殊功能键区: 长按 ↑/↓ 1s 以上分别发送 PgUp/PgDn, 持续按住则以 5 次/秒 (0.2s 周期) 频率连续发送
+function VTermPlugin:_setupArrowHoldRepeat()
+    local dlg = self.dialog
+    if not dlg or not dlg.button_table then return end
+
+    local function findBtn(txt)
+        local bt = dlg.button_table
+        if not bt then return nil end
+        local rows = bt.buttons_layout or bt.buttons or {}
+        for _, row in ipairs(rows) do
+            for _, b in ipairs(row) do
+                if type(b) == "table" and (b.text == txt or b.id == txt) then return b end
+            end
+        end
+    end
+
+    local function attach(btn, normal_seq, is_up)
+        if not btn or btn._vt_hold_attached then return end
+        btn._vt_hold_attached = true
+
+        local sendPg = function()
+            local v = self.view
+            if not v then return end
+            if v._vt_sb_mode and v._vt_sb then
+                if is_up then v:scrollUp(nil, 5) else v:scrollDown(nil, 5) end
+            else
+                v:sendBytes(is_up and "\27[5~" or "\27[6~")
+            end
+        end
+
+        local sendNormal = function()
+            if self.view then self.view:sendBytes(normal_seq) end
+        end
+
+        -- 登记 touch 手势记录手指初次按下时刻
+        if not btn.ges_events then btn.ges_events = {} end
+        btn.ges_events.TouchSelectButton = {
+            GestureRange:new{ ges = "touch", range = btn.dimen }
+        }
+        btn.onTouchSelectButton = function(s)
+            s._touch_t = time.now()
+            s._holding = true
+            s._sent_pg = false
+            s._rep_tok = (s._rep_tok or 0) + 1
+            return false
+        end
+
+        btn.hold_callback = function()
+            btn._holding = true
+            local tok = (btn._rep_tok or 0) + 1
+            btn._rep_tok = tok
+            -- 算准距按下满 1.0s 的剩余等待时间 (默认约 500ms 触发 hold, 补齐至 1s)
+            local G_reader_settings = rawget(_G, "G_reader_settings")
+            local hold_ms = G_reader_settings and G_reader_settings:readSetting("ges_hold_interval_ms") or 500
+            local elapsed = btn._touch_t and time.to_s(time.now() - btn._touch_t) or (hold_ms / 1000.0)
+            local wait_s = math.max(0, 1.0 - elapsed)
+
+            UIManager:scheduleIn(wait_s, function()
+                if btn._rep_tok ~= tok or not btn._holding then return end
+                -- 满 1s 首发 pgup/dn
+                btn._sent_pg = true
+                sendPg()
+                -- 持续按住: 以 5 次/秒 (周期 0.2s) 频率连续发送
+                local rep_fn
+                rep_fn = function()
+                    if btn._rep_tok ~= tok or not btn._holding then return end
+                    sendPg()
+                    UIManager:scheduleIn(0.2, rep_fn)
+                end
+                UIManager:scheduleIn(0.2, rep_fn)
+            end)
+        end
+
+        local orig_release = btn.onHoldReleaseSelectButton
+        btn.onHoldReleaseSelectButton = function(s, ...)
+            local holding = s._holding
+            s._holding = false
+            s._rep_tok = (s._rep_tok or 0) + 1
+            -- 若在 1s 内松开(介于 hold 触发与 1s 之间), 未发 pgup/dn 则保底发一次普通方向键
+            if holding and not s._sent_pg then
+                sendNormal()
+            end
+            if orig_release then return orig_release(s, ...) end
+            return true
+        end
+
+        local orig_cb = btn.callback
+        btn.callback = function()
+            if btn._sent_pg then
+                btn._sent_pg = false
+                return
+            end
+            if orig_cb then orig_cb() else sendNormal() end
+        end
+    end
+
+    attach(findBtn("↑"), "\27[A", true)
+    attach(findBtn("↓"), "\27[B", false)
+end
+
 function VTermPlugin:startTerminal(session, opts)
     session = session or { type = "local" }
     self._vt_session = session
@@ -823,6 +925,7 @@ function VTermPlugin:startTerminal(session, opts)
     end
     -- 收起状态(按钮栏+键盘全收)下 tap 网格唤回的通道
     view._vt_toggle_cb = function() self:_toggleKeyboardBar() end
+    self:_setupArrowHoldRepeat()
 
     -- 4. 初始化底层 libvterm 状态机
     -- 字号设置等"仅重建对话框"路径: 终端状态(vt/screen/scrollback/PTY)不重建,
@@ -1579,6 +1682,7 @@ function VTermPlugin:_reattachVTerm()
         UIManager:setDirty(dlg, "ui")
     end
     view._vt_toggle_cb = function() self:_toggleKeyboardBar() end
+    self:_setupArrowHoldRepeat()
 
     -- 终端状态机与 IO 闭环挂到新 view(仍是同一个 vt/screen/PTY/scrollback)
     view.vt = self.vt
@@ -3161,6 +3265,132 @@ function VTermPlugin:_runToolbarSuite()
         assert(sent[6] and sent[6]:match("\27%[<64;%d+;%d+M$"), "滚轮缺失: " .. tostring(sent[6]))
         assert(#sent == 8, "应 8 发(点2+拖2+滚3): n=" .. #sent)
         return "sgr ok n=" .. #sent
+    end)
+
+    -- TB37 特殊功能键区长按 ↑/↓ 满 1s 发 PgUp/PgDn，并在持续按住时以 5Hz 连发
+    check("TB37 特殊功能键区长按↑/↓满1s发PgUp/PgDn及5Hz连发", function()
+        local bt = self.dialog.button_table
+        local btn_up, btn_dn
+        for _, row in ipairs(bt.buttons_layout or bt.buttons or {}) do
+            for _, b in ipairs(row) do
+                if type(b) == "table" then
+                    if b.text == "↑" then btn_up = b end
+                    if b.text == "↓" then btn_dn = b end
+                end
+            end
+        end
+        assert(btn_up and btn_dn, "未找到↑/↓按钮")
+
+        local v = self.view
+        local sent = {}
+        local orig_send = v.sendBytes
+        v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+
+        -- 1. 普通轻点: 立即发普通方向键
+        sent = {}
+        btn_up.callback()
+        assert(#sent == 1 and sent[1] == "\27[A", "轻点↑应发\\27[A: " .. tostring(sent[1]))
+
+        sent = {}
+        btn_dn.callback()
+        assert(#sent == 1 and sent[1] == "\27[B", "轻点↓应发\\27[B: " .. tostring(sent[1]))
+
+        -- 2. 长按 < 1s 提前抬手: 未达 1s 不发 PgUp, 抬手保底发普通方向键
+        sent = {}
+        btn_up:onTouchSelectButton()
+        btn_up.hold_callback()
+        btn_up:onHoldReleaseSelectButton()
+        assert(#sent == 1 and sent[1] == "\27[A", "短长按抬手应保底发方向键: " .. tostring(sent[1]))
+
+        -- 3. 长按满 1s: 发送 PgUp (\27[5~), 持续按住以 5Hz (0.2s) 连发
+        sent = {}
+        local sched_tasks = {}
+        local orig_scheduleIn = UIManager.scheduleIn
+        UIManager.scheduleIn = function(_, delay, fn)
+            table.insert(sched_tasks, { delay = delay, fn = fn })
+        end
+
+        btn_up:onTouchSelectButton()
+        btn_up.hold_callback()
+        assert(#sched_tasks >= 1, "应调度满 1s 触发任务")
+
+        -- 模拟满 1s 触发
+        local task1 = sched_tasks[#sched_tasks]
+        task1.fn()
+        assert(#sent == 1 and sent[1] == "\27[5~", "满 1s 应首发 PgUp: " .. tostring(sent[1]))
+
+        -- 模拟持续按住: 下一拍 (0.2s)
+        local task2 = sched_tasks[#sched_tasks]
+        task2.fn()
+        assert(#sent == 2 and sent[2] == "\27[5~", "持续按住应连发 PgUp: " .. tostring(sent[2]))
+
+        -- 抬起: 停止连发
+        btn_up:onHoldReleaseSelectButton()
+        local n_before = #sent
+        -- 抬起后再跑之前排入的旧回调应被 token 拦截
+        task2.fn()
+        assert(#sent == n_before, "抬手后连发应立即停止")
+
+        -- 4. 同理验证 ↓ 长按满 1s 发 PgDn (\27[6~)
+        sent = {}
+        sched_tasks = {}
+        btn_dn:onTouchSelectButton()
+        btn_dn.hold_callback()
+        sched_tasks[#sched_tasks].fn()
+        assert(#sent == 1 and sent[1] == "\27[6~", "满 1s 应首发 PgDn: " .. tostring(sent[1]))
+        btn_dn:onHoldReleaseSelectButton()
+
+        UIManager.scheduleIn = orig_scheduleIn
+        v.sendBytes = orig_send
+        return "arrow-hold-5hz ok"
+    end)
+
+    -- TB38 触摸鼠标使能 + Ctrl 挂起 + 屏幕长按 → 鼠标右键 (btn=2)
+    check("TB38 触摸鼠标使能+Ctrl挂起+屏幕长按→鼠标右键", function()
+        local v = self.view
+        local sent = {}
+        local orig_send = v.sendBytes
+        v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+        local oldpty = v.pty
+        v.pty = { mouse_click = true, mouse_drag = true, mouse_sgr = true }
+        local r = v:_gridRegion()
+        local c = Geom:new{
+            x = r.x + 3 * v.cell_w + math.floor(v.cell_w / 2),
+            y = r.y + 4 * v.cell_h + math.floor(v.cell_h / 2),
+            w = 1, h = 1,
+        }
+
+        -- 场景 A: 鼠标使能但无 Ctrl 挂起 → 屏幕长按不发右键
+        sent = {}
+        v._vt_ctrl_pending = false
+        v:onHoldTextBox(nil, { pos = c })
+        assert(#sent == 0, "无 Ctrl 挂起时不应发鼠标右键: " .. tostring(sent[1]))
+
+        -- 场景 B: 鼠标使能 + Ctrl 挂起 → 屏幕长按发出鼠标右键按下+释放 (btn = 2)
+        sent = {}
+        local ctrl_cleared = false
+        v._vt_ctrl_pending = true
+        v._vt_on_ctrl_used = function() ctrl_cleared = true end
+        v:onHoldTextBox(nil, { pos = c })
+
+        -- 校验 SGR 序列格式: \27[<2;col;rowM (按下) + \27[<2;col;rowm (释放)
+        assert(#sent == 2, "应发右键按下+释放 2 发, 实得: " .. #sent)
+        assert(sent[1] and sent[1]:match("^\27%[<2;%d+;%d+M$"), "右键按下序列错误: " .. tostring(sent[1]))
+        assert(sent[2] and sent[2]:match("^\27%[<2;%d+;%d+m$"), "右键释放序列错误: " .. tostring(sent[2]))
+        assert(sent[1]:match("^\27%[<2;4;5M$"), "单元格坐标计算错误(col=4,row=5): " .. tostring(sent[1]))
+        assert(v._vt_ctrl_pending == false, "Ctrl 状态应已被消费")
+        assert(ctrl_cleared == true, "应触发 Ctrl 复位回调")
+
+        -- 场景 C: 鼠标未使能 + Ctrl 挂起 → 屏幕长按不发右键
+        sent = {}
+        v.pty = { mouse_click = false, mouse_drag = false }
+        v._vt_ctrl_pending = true
+        v:onHoldTextBox(nil, { pos = c })
+        assert(#sent == 0, "鼠标未使能时不应发右键")
+
+        v.pty = oldpty
+        v.sendBytes = orig_send
+        return "rclick-sgr ok"
     end)
 
     -- TB34 会话编辑器链路: 已下线——编辑器 getText/collect/update 全链路

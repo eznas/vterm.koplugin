@@ -556,11 +556,32 @@ function VTermView:sendBytes(seq)
     self:_ctrlWrite(seq)
 end
 
--- 长按终端区: 彻底禁用 InputText 的剪贴板面板(复制/粘贴/全选)。
--- 终端里长按另有语义(⇆ 开启时按住方向手势连发), 弹出模态面板会打断手势;
--- 吞掉 hold + 置 _hold_handled 让随后的 hold_release 也被消费(不穿透父容器)。
-function VTermView:holdTextBox()
+-- 长按终端区:
+-- 1. 触摸鼠标使能 + Ctrl 挂起 + 在屏幕网格上长按: 定义为按下鼠标右键 (btn = 2, 按下+释放)。
+-- 2. 其余场景: 彻底禁用 InputText 的剪贴板面板(复制/粘贴/全选), 吞掉 hold + 置 _hold_handled
+--    避免模态弹窗打断终端手势。
+function VTermView:onHoldTextBox(arg, ges)
+    return self:holdTextBox(arg, ges)
+end
+
+function VTermView:holdTextBox(arg, ges)
     self._hold_handled = true
+    local ev = (type(ges) == "table" and ges.pos and ges)
+        or (type(arg) == "table" and arg.pos and arg)
+        or ges or arg
+    local pos = ev and ev.pos
+    if self:_mouseActive() and self._vt_ctrl_pending and pos and not self._vt_collapsed then
+        local r = self:_gridRegion()
+        if r:contains(pos) then
+            self:_ensureLive()
+            local cell = self:_mouseCell(pos)
+            self:_mouseSend(2, true, cell)
+            self:_mouseSend(2, false, cell)
+            self._vt_ctrl_pending = false
+            if self._vt_on_ctrl_used then self:_vt_on_ctrl_used() end
+            return true
+        end
+    end
     return true
 end
 

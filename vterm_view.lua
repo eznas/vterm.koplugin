@@ -557,7 +557,9 @@ function VTermView:sendBytes(seq)
 end
 
 -- 长按终端区:
--- 1. 触摸鼠标使能 + Ctrl 挂起 + 在屏幕网格上长按: 定义为按下鼠标右键 (btn = 2, 按下+释放)。
+-- 1. 触摸鼠标使能 + Ctrl 挂起 + 在屏幕网格上长按: 定义为按下鼠标右键 (btn = 2)。
+--    保持按住状态 (_vt_mouse_down, _vt_mouse_btn = 2), 支持随手指移动拖拽选区 (btn = 34),
+--    手指抬起时释放 (btn = 2)。
 -- 2. 其余场景: 彻底禁用 InputText 的剪贴板面板(复制/粘贴/全选), 吞掉 hold + 置 _hold_handled
 --    避免模态弹窗打断终端手势。
 function VTermView:onHoldTextBox(arg, ges)
@@ -575,12 +577,24 @@ function VTermView:holdTextBox(arg, ges)
         if r:contains(pos) then
             self:_ensureLive()
             local cell = self:_mouseCell(pos)
-            self:_mouseSend(2, true, cell)
-            self:_mouseSend(2, false, cell)
+            self._vt_mouse_down = cell
+            self._vt_mouse_btn = 2
+            self:_mouseSend(2, true, cell) -- 右键按下 (SGR: \27[<2;col;rowM)
             self._vt_ctrl_pending = false
             if self._vt_on_ctrl_used then self:_vt_on_ctrl_used() end
             return true
         end
+    end
+    return true
+end
+
+function VTermView:onHoldReleaseTextBox(arg, ges)
+    if self:_mouseActive() and self._vt_mouse_down then
+        local btn = self._vt_mouse_btn or 0
+        self:_mouseSend(btn, false, self._vt_mouse_down)
+        self._vt_mouse_down = nil
+        self._vt_mouse_btn = nil
+        return true
     end
     return true
 end
@@ -831,11 +845,11 @@ function VTermView:setArrowGestures(enable)
         self.ges_events.VTermSwipe = { grid_matcher("swipe") }
         self.ges_events.VTermPan = { grid_matcher("pan") }
         self.ges_events.VTermPanRelease = { release_matcher("pan_release") }
+        self.ges_events.VTermHoldPan = { grid_matcher("hold_pan") }
+        self.ges_events.VTermHoldPanRelease = { release_matcher("hold_release") }
         self.ges_events.VTermTouch = {
             { ges = "touch", match = function(_, gs) return gs.ges == "touch" end },
         }
-        self.ges_events.VTermHoldPan = nil
-        self.ges_events.VTermHoldPanRelease = nil
     end
 end
 
@@ -1011,10 +1025,12 @@ function VTermView:onVTermHoldPan(_, ges)
             local cell = self:_mouseCell(p)
             if not self._vt_mouse_down then
                 self._vt_mouse_down = cell
+                self._vt_mouse_btn = 0
                 self:_mouseSend(0, true, cell)
             end
             if cell.col ~= self._vt_mouse_down.col or cell.row ~= self._vt_mouse_down.row then
-                self:_mouseSend(32, true, cell)
+                local btn = self._vt_mouse_btn or 0
+                self:_mouseSend(32 + btn, true, cell) -- 左键拖动=32, 右键拖动=34!
                 self._vt_mouse_down = cell
             end
         end
@@ -1176,8 +1192,10 @@ function VTermView:onVTermHoldPanRelease(_, ges)
     self:_gesLog("RELEASE")
     -- 鼠标模式: 拖动结束 = 抬起
     if self:_mouseActive() and self._vt_mouse_down then
-        self:_mouseSend(0, false, self._vt_mouse_down)
+        local btn = self._vt_mouse_btn or 0
+        self:_mouseSend(btn, false, self._vt_mouse_down)
         self._vt_mouse_down = nil
+        self._vt_mouse_btn = nil
         return true
     end
     self:_stopArrowRepeat()

@@ -72,7 +72,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.3.0" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.3.1" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -3345,7 +3345,7 @@ function VTermPlugin:_runToolbarSuite()
         return "arrow-hold-5hz ok"
     end)
 
-    -- TB38 触摸鼠标使能 + Ctrl 挂起 + 屏幕长按 → 鼠标右键 (btn=2)
+    -- TB38 触摸鼠标使能 + Ctrl 挂起 + 屏幕长按 → 鼠标右键 (btn=2) 按下并抬手释放
     check("TB38 触摸鼠标使能+Ctrl挂起+屏幕长按→鼠标右键", function()
         local v = self.view
         local sent = {}
@@ -3366,20 +3366,26 @@ function VTermPlugin:_runToolbarSuite()
         v:onHoldTextBox(nil, { pos = c })
         assert(#sent == 0, "无 Ctrl 挂起时不应发鼠标右键: " .. tostring(sent[1]))
 
-        -- 场景 B: 鼠标使能 + Ctrl 挂起 → 屏幕长按发出鼠标右键按下+释放 (btn = 2)
+        -- 场景 B: 鼠标使能 + Ctrl 挂起 → 屏幕长按发出右键按下，抬手发出释放 (btn = 2)
         sent = {}
         local ctrl_cleared = false
         v._vt_ctrl_pending = true
         v._vt_on_ctrl_used = function() ctrl_cleared = true end
         v:onHoldTextBox(nil, { pos = c })
 
-        -- 校验 SGR 序列格式: \27[<2;col;rowM (按下) + \27[<2;col;rowm (释放)
-        assert(#sent == 2, "应发右键按下+释放 2 发, 实得: " .. #sent)
+        -- 校验按下序列与状态
+        assert(#sent == 1, "长按应发右键按下 1 发, 实得: " .. #sent)
         assert(sent[1] and sent[1]:match("^\27%[<2;%d+;%d+M$"), "右键按下序列错误: " .. tostring(sent[1]))
-        assert(sent[2] and sent[2]:match("^\27%[<2;%d+;%d+m$"), "右键释放序列错误: " .. tostring(sent[2]))
         assert(sent[1]:match("^\27%[<2;4;5M$"), "单元格坐标计算错误(col=4,row=5): " .. tostring(sent[1]))
+        assert(v._vt_mouse_btn == 2, "应记录按键为右键(btn=2)")
         assert(v._vt_ctrl_pending == false, "Ctrl 状态应已被消费")
         assert(ctrl_cleared == true, "应触发 Ctrl 复位回调")
+
+        -- 抬手: 触发 onHoldReleaseTextBox
+        v:onHoldReleaseTextBox(nil, {})
+        assert(#sent == 2, "抬手后应累计 2 发(按下+释放), 实得: " .. #sent)
+        assert(sent[2] and sent[2]:match("^\27%[<2;%d+;%d+m$"), "右键释放序列错误: " .. tostring(sent[2]))
+        assert(v._vt_mouse_down == nil and v._vt_mouse_btn == nil, "释放后鼠标按下状态应清空")
 
         -- 场景 C: 鼠标未使能 + Ctrl 挂起 → 屏幕长按不发右键
         sent = {}
@@ -3391,6 +3397,42 @@ function VTermPlugin:_runToolbarSuite()
         v.pty = oldpty
         v.sendBytes = orig_send
         return "rclick-sgr ok"
+    end)
+
+    -- TB39 独立右键拖拽选区保持: Ctrl+长按建立右键态 → hold_pan 拖动发送 btn=34 (32+2) → 抬手释放
+    check("TB39 独立右键拖拽选区保持 (btn=34 motion)", function()
+        local v = self.view
+        local sent = {}
+        local orig_send = v.sendBytes
+        v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+        local oldpty = v.pty
+        v.pty = { mouse_click = true, mouse_drag = true, mouse_sgr = true }
+        local r = v:_gridRegion()
+        local c1 = Geom:new{ x = r.x + 2 * v.cell_w, y = r.y + 2 * v.cell_h, w = 1, h = 1 } -- col=3, row=3
+        local c2 = Geom:new{ x = r.x + 6 * v.cell_w, y = r.y + 4 * v.cell_h, w = 1, h = 1 } -- col=7, row=5
+        local c3 = Geom:new{ x = r.x + 10 * v.cell_w, y = r.y + 8 * v.cell_h, w = 1, h = 1 } -- col=11, row=9
+
+        v._vt_ctrl_pending = true
+        -- 1. 长按建立右键态
+        v:onHoldTextBox(nil, { pos = c1 })
+        assert(#sent == 1 and sent[1] == "\27[<2;3;3M", "右键按下错误: " .. tostring(sent[1]))
+        assert(v._vt_mouse_btn == 2, "应记录右键模式")
+
+        -- 2. 持续拖动 (hold_pan): 必须发送 32 + 2 = 34 的 motion 序列
+        v:onVTermHoldPan(nil, { pos = c2 })
+        assert(#sent == 2 and sent[2] == "\27[<34;7;5M", "右键拖动 motion 错误(应为34): " .. tostring(sent[2]))
+
+        v:onVTermHoldPan(nil, { pos = c3 })
+        assert(#sent == 3 and sent[3] == "\27[<34;11;9M", "右键拖动第二拍 motion 错误: " .. tostring(sent[3]))
+
+        -- 3. 抬手释放 (hold_release / pan_release)
+        v:onVTermHoldPanRelease(nil, {})
+        assert(#sent == 4 and sent[4] == "\27[<2;11;9m", "右键释放错误: " .. tostring(sent[4]))
+        assert(v._vt_mouse_down == nil and v._vt_mouse_btn == nil, "拖拽结束后状态应复位")
+
+        v.pty = oldpty
+        v.sendBytes = orig_send
+        return "rclick-drag-34 ok"
     end)
 
     -- TB34 会话编辑器链路: 已下线——编辑器 getText/collect/update 全链路

@@ -10,13 +10,13 @@ VTerm 让 KOReader 变成一个可用的终端：以 **libvterm**（Neovim 的 C
 
 ## 界面截图
 
-本地 shell 与中文输入条（拼音组词、候选条内联显示）：
+vim 9.1 中文输入（v1.4.0 快捷键条：开关灰底点亮、`Ctrl`+`/` 右键）：
 
-![VTerm 终端与中文输入](docs/terminal.png)
+![vim 中文输入与 v1.4.0 快捷键条](docs/hello-world.jpg)
 
-vim 9.1 编辑中文文本（全角字符在行尾正确折行）：
+SSH 远程 pi 智能体（Termux + tmux）——中文天气查询，全角渲染无乱码：
 
-![VTerm 中的 vim](docs/vim.png)
+![SSH 远程运行 pi 智能体](docs/pi-agent.jpg)
 
 ## 特性
 

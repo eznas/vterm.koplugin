@@ -10,13 +10,13 @@ Everything lives inside the plugin folder: binaries, `terminfo`, locale sources,
 
 ## Screenshots
 
-Local shell with the Chinese input bar (pinyin composition with inline candidates):
+vim 9.1 with CJK input on the v1.4.0 quick-key bar (gray-background toggles, `Ctrl` + `/` right-click):
 
-![VTerm terminal with Chinese input](docs/terminal.png)
+![vim with Chinese input and the v1.4.0 quick-key bar](docs/hello-world.jpg)
 
-vim 9.1 editing a file with CJK text (fullwidth characters wrap correctly at the screen edge):
+pi AI agent over SSH (Termux + tmux) — a Chinese weather query with correct fullwidth rendering:
 
-![vim in VTerm](docs/vim.png)
+![pi agent over SSH in VTerm](docs/pi-agent.jpg)
 
 ## Highlights
 

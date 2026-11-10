@@ -103,18 +103,13 @@ local VTermFFI = {}
 function VTermFFI.load(plugin_dir)
     -- ARM 设备优先:两套 .so 会同时随插件分发,文件存在不代表本机能加载,
     -- ARM .so 在模拟器(x86_64)上必然加载失败,自然回落 x86_64。
-    if plugin_dir then
-        local ok, lib = pcall(ffi.load, plugin_dir .. "/lib/armv7_softfp/libvterm.so")
-        if ok then
-            return lib
-        end
-        return ffi.load(plugin_dir .. "/lib/x86_64/libvterm.so")
-    end
-    local ok, lib = pcall(ffi.load, "./lib/armv7_softfp/libvterm.so")
+    -- 两条分支只差路径前缀(plugin_dir 或 ./), 统一成一份。
+    local base = plugin_dir or "."
+    local ok, lib = pcall(ffi.load, base .. "/lib/armv7_softfp/libvterm.so")
     if ok then
         return lib
     end
-    return ffi.load("./lib/x86_64/libvterm.so")
+    return ffi.load(base .. "/lib/x86_64/libvterm.so")
 end
 
 function VTermFFI.newTerminal(lib, rows, cols)

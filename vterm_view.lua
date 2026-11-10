@@ -34,6 +34,28 @@ local time = require("ui/time")
 local ffi = require("ffi")
 local util = require("util")
 
+-- 方向/功能键序列常量: 生产路径复用, 免每次手势重建字面量。
+local SEQ_UP, SEQ_DOWN = "\27[A", "\27[B"
+local SEQ_LEFT, SEQ_RIGHT = "\27[D", "\27[C"
+local SEQ_PGUP, SEQ_PGDN = "\27[5~", "\27[6~"
+local SEQ_HOME, SEQ_END = "\27[H", "\27[F"
+-- 罗盘制方向→方向键(真机 ges.log 实证全是 south/north/east/west), 对角取主轴
+-- 垂直轴优先(终端 ↑/↓ 最常用); 列表顺序即优先级, 收敛成文件局部免每次分配表。
+local ARROW_MAP = {
+    north = SEQ_UP, south = SEQ_DOWN, east = SEQ_RIGHT, west = SEQ_LEFT,
+    up = SEQ_UP, down = SEQ_DOWN, right = SEQ_RIGHT, left = SEQ_LEFT,
+}
+local ARROW_AXES = { "north", "south", "east", "west", "up", "down", "right", "left" }
+
+-- 行中光标回拉到已提交行尾(组词/行尾追加前): 复用两处(_vtKeyEventEnd 的
+-- IME 组词写入与行尾提交路径)。pos>clin 表示已在行尾, 无需发键。
+local function pullToLineTail(view, pos, clin)
+    if pos <= clin then
+        view:sendBytes(string.rep(SEQ_RIGHT, clin + 1 - pos))
+        view.charpos = clin + 1
+    end
+end
+
 local VTermView = InputText:extend{
     name = "VTermView",
     vt = nil,
@@ -66,12 +88,15 @@ local VTermView = InputText:extend{
     _vt_page_dir = nil,    -- ⇆关: 本次拖动已处理的翻页方向(pan 流与收尾 swipe 去重)
     _vt_arrows = false,    -- 方向手势开关: true=网格上滑动发方向键
     _vt_shift_mode = false,-- Shift 挂起状态缓存(跨键盘收起/全屏持久化)
+    _vt_plugin = nil,      -- main.lua(插件单例): Ctrl 挂起状态存这里——
+                           -- ⚠️真机实证 view 实例会随 dialog 重建而分叉, 状态存
+                           -- view 上会被写进旧实例(点 Ctrl 改 self.view, 手势到
+                           -- 的却是另一个实例), Ctrl+触摸→右键恒失效。
     _vt_arrow_ges = nil,   -- 已注册的手势对象(关闭时摘除)
     STABLE_PX = 12,        -- 手指停住判定阈值(px): 位移小于此视为抖动, 不重置停顿计时
     SWIPE_UNIT = 120,      -- 同向拖动累计多少像素才发一发(防误触/刷屏; 约两行字高)
     REPEAT_DELAY = 1.0,    -- 停住满多少秒开始连发
     REPEAT_PERIOD = 0.2,   -- 连发周期(秒): 5 次/秒(用户定稿)
-    REPEAT_MOVE_PX = 80,   -- 连发期间判"真移动"的步长门槛(px): 小于此的抖动不打断连发
     _vt_collapsed = false, -- ⌨ 收起态(按钮栏+软键盘全收): tap 网格唤回
     _vt_toggle_cb = nil,   -- main.lua 注入的收放切换回调
     _vt_extra_h = 0,       -- 收起手术后额外占位高度(原按钮栏空间, 网格扩展区)
@@ -230,9 +255,23 @@ end
 -- ⚠️⇆ 开启时滑动让位普通键(方向/PgUp/PgDn/Shift+翻页), 鼠标只保留 tap
 -- 点击——滑动被鼠标滚轮/拖动抢占是冲突, 用户定稿 2026-11-08。
 
+-- Ctrl 挂起状态读写: 经插件单例(_vt_plugin)存取——view 实例会随 dialog 重建
+-- 分叉(真机实证), 状态存 view 会被写进旧实例导致 Ctrl+触摸→右键失效。
+-- 无插件引用时(测试桩)退回 view 自身字段。
+function VTermView:_ctrlPending()
+    if self._vt_plugin then return self._vt_plugin._vt_ctrl_pending end
+    return self._vt_ctrl_pending
+end
+
+function VTermView:_setCtrlPending(v)
+    if self._vt_plugin then self._vt_plugin._vt_ctrl_pending = v and true or false end
+    self._vt_ctrl_pending = v and true or false
+end
+
 function VTermView:_mouseActive()
     return self.pty and (self.pty.mouse_click or self.pty.mouse_drag) and true or false
 end
+
 
 -- 屏幕坐标 → 1-based 网格单元格(SGR 鼠标坐标)
 function VTermView:_mouseCell(pos)
@@ -242,6 +281,23 @@ function VTermView:_mouseCell(pos)
     col = math.max(1, math.min(self.cols, col))
     row = math.max(1, math.min(self.rows, row))
     return { col = col, row = row }
+end
+
+-- 同一格子按下+释放(单击): tap 左键 / "右键"按钮都用这个形状。
+function VTermView:_mouseClick(btn, cell)
+    self:_mouseSend(btn, true, cell)
+    self:_mouseSend(btn, false, cell)
+end
+
+-- 拖动/长按结束: 释放按下的键并清空按住态(两处 release 处理器逐字相同)。
+-- 返回是否确实释放了一个按住态(调用方据此决定是否吞掉事件)。
+function VTermView:_mouseRelease()
+    if not (self:_mouseActive() and self._vt_mouse_down) then return false end
+    local btn = self._vt_mouse_btn or 0
+    self:_mouseSend(btn, false, self._vt_mouse_down)
+    self._vt_mouse_down = nil
+    self._vt_mouse_btn = nil
+    return true
 end
 
 function VTermView:_mouseSend(btn, pressed, cell)
@@ -275,6 +331,18 @@ local function indexedLum(idx)
         + lv[i % 6 + 1] * 11) / 100)
 end
 
+-- Color8(灰阶)按亮度 memo: 整屏重绘里每个非默认背景格都会调 _cellBgGray,
+-- 亮度只有 0-255 共 256 种(+ 深色 indexed 重映射的 180), 缓存后零逐格 cdata 分配。
+local _gray_cache = {}
+local function gray(lum)
+    local c = _gray_cache[lum]
+    if not c then
+        c = Blitbuffer.Color8(lum)
+        _gray_cache[lum] = c
+    end
+    return c
+end
+
 -- cell 背景色 → e-ink 灰阶 Color8(无背景返回 nil)。
 -- 位定义(libvterm vterm.h): TYPE_MASK=0x01(0=RGB,1=INDEXED),
 -- DEFAULT_FG=0x02, DEFAULT_BG=0x04。
@@ -292,12 +360,12 @@ function VTermView:_cellBgGray(cell)
         local lum = indexedLum(bg.indexed.idx)
         -- indexed 深色是应用有意的深色高亮(远端 vim Visual 选区 ctermbg=238
         -- 等, 属性探针实证), e-ink 上黑底黑字无法分辨 → 重映射浅灰底黑字
-        if lum < 100 then return Blitbuffer.Color8(180) end
-        return Blitbuffer.Color8(lum)
+        if lum < 100 then return gray(180) end
+        return gray(lum)
     end
     local lum = math.floor((bg.rgb.red * 30 + bg.rgb.green * 59 + bg.rgb.blue * 11) / 100)
     if lum < 100 then return nil end -- RGB 深色 = 库默认黑 pen(state.c:163), 不画防全屏涂黑
-    return Blitbuffer.Color8(lum)
+    return gray(lum)
 end
 
 -- 防止点击终端画布时原生 InputText 移动单行光标;
@@ -305,8 +373,6 @@ end
 -- 唤回前先滚回实时帧(翻看态下打字, shell 回显会被历史帧遮住)。
 -- 鼠标模式: tap = 抬起(按下由 touch 发) → vim 收到完整点击(移动光标/选词)。
 function VTermView:onTapTextBox(arg, ges)
-    self:_gesLog("TAP collapsed=" .. tostring(self._vt_collapsed)
-        .. " pos=" .. tostring(ges.pos and (ges.pos.x .. "," .. ges.pos.y) or "nil"))
     if self._vt_collapsed and self._vt_toggle_cb then
         self:_ensureLive()
         self._vt_toggle_cb()
@@ -319,12 +385,26 @@ function VTermView:onTapTextBox(arg, ges)
         if r:contains(ges.pos) then
             self:_ensureLive()
             local cell = self:_mouseCell(ges.pos)
-            self:_mouseSend(0, true, cell)
-            self:_mouseSend(0, false, cell)
+            -- 记录最近触摸格子: 功能键区"右键"按钮在此处发右键单击(用户定稿 2026-11-09)
+            self._vt_last_cell = cell
+            self:_mouseClick(0, cell)
             self._vt_mouse_down = nil
             return true
         end
     end
+    return true
+end
+
+-- 功能键区"右键"按钮: 在最近触摸格子处发单次右键(按下+释放)。无触摸记录时
+-- 退回网格中心(用户定稿 2026-11-09: 彻底废弃 Ctrl/Shift+触摸右键, 改按钮触发)。
+function VTermView:sendRightClick()
+    if not self:_mouseActive() or self._vt_collapsed then return false end
+    self:_ensureLive()
+    local cell = self._vt_last_cell
+    if not cell then
+        cell = { col = math.ceil(self.cols / 2), row = math.ceil(self.rows / 2) }
+    end
+    self:_mouseClick(2, cell)
     return true
 end
 
@@ -421,7 +501,7 @@ function VTermView:_vtKeyEventEnd(char, before_len)
     -- 永远发不出去。放行条件: 非 IME 布局, 或 Ctrl 挂起(按控制字节处理)。
     local w = rawget(self, "addChars")
     local ime_active = type(w) == "table" and w._vt_ime_active
-    if tail:sub(-1) == "]" and ime_active and not self._vt_ctrl_pending then
+    if tail:sub(-1) == "]" and ime_active and not self:_ctrlPending() then
         return end -- 候选预览未收口,组词中
     -- 已提交行长(行内坐标): 当前行的已提交部分 = charlist[ls+1.._vt_sent]
     local clin = self._vt_sent - ls
@@ -434,10 +514,7 @@ function VTermView:_vtKeyEventEnd(char, before_len)
         if norm_a ~= norm_c then
             -- IME 组词写入: 光标在行中先回拉已提交行尾(组词区只认行尾)
             local pos = pre_pos or clin + 1
-            if pos <= clin then
-                self:sendBytes(string.rep("\27[C", clin + 1 - pos))
-                self.charpos = clin + 1
-            end
+            pullToLineTail(self, pos, clin)
             return
         end
         -- 直通字符 + 光标在已提交行内 → 真行中插入
@@ -479,10 +556,7 @@ function VTermView:_vtKeyEventEnd(char, before_len)
         return
     end
     local pos = pre_pos or clin + 1
-    if pos <= clin then
-        self:sendBytes(string.rep("\27[C", clin + 1 - pos))
-        self.charpos = clin + 1
-    end
+    pullToLineTail(self, pos, clin)
     self._vt_sent = after_len
     if tail:find("\n", 1, true) or tail:find("\r", 1, true) then
         self._vt_bar_line = nil      -- 回车: 本行结束, 清空中文镜像
@@ -521,7 +595,7 @@ end
 
 -- Ctrl 修饰 + PTY 写入
 function VTermView:_ctrlWrite(data)
-    if self._vt_ctrl_pending then
+    if self:_ctrlPending() then
         -- 标准 C0 控制字符变换: Ctrl+<chr(0x40..0x5F)> = chr(code-0x40)。
         -- 覆盖 A-Z(既有)与 @ [ \ ] ^ _(Ctrl+]=0x1D 是 vim 帮助跳 tag 的
         -- 标准键); 小写字母同变换; Space→NUL(0x00); ?→DEL(0x7F)。
@@ -542,17 +616,20 @@ function VTermView:_ctrlWrite(data)
                 data = string.char(ctrl) .. data:sub(2)
             end
         end
-        self._vt_ctrl_pending = false
+        self:_setCtrlPending(false)
         -- Ctrl 是一次性修饰: 用掉后通知按钮把下划线撤掉
         if self._vt_on_ctrl_used then self:_vt_on_ctrl_used() end
     end
     if self._vt_write then self._vt_write(data) end
 end
 
--- 按钮行/方向键等直接发送通道
+-- 按钮行/方向键等直接发送通道。
+-- ⚠️不 refreshInputBar: 候选条内容只由 charlist/_vt_bar_line 驱动, 而它们
+-- 只在 addChars/delChar/_vtKeyEventEnd 里改(这三处已各自显式刷新)。方向键/
+-- PgUp·Dn/鼠标序列/连发 tick 从不改候选条, 若在这里刷新会给每个导航键与
+-- 每个 0.2s 连发 tick 招来一次全宽脏区 + 整屏 paintTo(纯浪费, 且易触发 ui 波形)。
 function VTermView:sendBytes(seq)
     if not seq or #seq == 0 then return end
-    self:refreshInputBar()
     self:_ctrlWrite(seq)
 end
 
@@ -567,35 +644,15 @@ function VTermView:onHoldTextBox(arg, ges)
 end
 
 function VTermView:holdTextBox(arg, ges)
+    -- 长按终端区: 吞掉 hold(不弹 InputText 剪贴板面板), 置 _hold_handled 让
+    -- 随后的 hold_release 一并消费。右键已改由功能键区"右键"按钮触发
+    -- (sendRightClick, 用户定稿 2026-11-09: 彻底废弃 Ctrl+触摸右键)。
     self._hold_handled = true
-    local ev = (type(ges) == "table" and ges.pos and ges)
-        or (type(arg) == "table" and arg.pos and arg)
-        or ges or arg
-    local pos = ev and ev.pos
-    if self:_mouseActive() and self._vt_ctrl_pending and pos and not self._vt_collapsed then
-        local r = self:_gridRegion()
-        if r:contains(pos) then
-            self:_ensureLive()
-            local cell = self:_mouseCell(pos)
-            self._vt_mouse_down = cell
-            self._vt_mouse_btn = 2
-            self:_mouseSend(2, true, cell) -- 右键按下 (SGR: \27[<2;col;rowM)
-            self._vt_ctrl_pending = false
-            if self._vt_on_ctrl_used then self:_vt_on_ctrl_used() end
-            return true
-        end
-    end
     return true
 end
 
 function VTermView:onHoldReleaseTextBox(arg, ges)
-    if self:_mouseActive() and self._vt_mouse_down then
-        local btn = self._vt_mouse_btn or 0
-        self:_mouseSend(btn, false, self._vt_mouse_down)
-        self._vt_mouse_down = nil
-        self._vt_mouse_btn = nil
-        return true
-    end
+    self:_mouseRelease()
     return true
 end
 
@@ -703,7 +760,7 @@ function VTermView:leftChar(skip_callback)
     local maxpos = math.max(1, (n > sent) and (sent - ls + 1) or (n - ls + 1))
     local pos = math.min(self.charpos or maxpos, maxpos)
     self.charpos = math.max(1, pos - 1)
-    self:sendBytes("\27[D")
+    self:sendBytes(SEQ_LEFT)
 end
 
 function VTermView:rightChar(skip_callback)
@@ -712,29 +769,29 @@ function VTermView:rightChar(skip_callback)
     local maxpos = math.max(1, (n > sent) and (sent - ls + 1) or (n - ls + 1))
     local pos = math.min(self.charpos or maxpos, maxpos)
     self.charpos = math.min(pos + 1, maxpos)
-    self:sendBytes("\27[C")
+    self:sendBytes(SEQ_RIGHT)
 end
 
 function VTermView:upLine(skip_callback)
     self.charpos = nil -- 换历史行: 行内容整体被 shell 替换, 光标模型重置
-    self:sendBytes("\27[A")
+    self:sendBytes(SEQ_UP)
 end
 
 function VTermView:downLine(skip_callback)
     self.charpos = nil
-    self:sendBytes("\27[B")
+    self:sendBytes(SEQ_DOWN)
 end
 
 function VTermView:goToStartOfLine(skip_callback)
     self.charpos = 1 -- 行首键同步光标模型(有草稿时 readline 也在提交行内移动)
-    self:sendBytes("\27[H")
+    self:sendBytes(SEQ_HOME)
 end
 
 function VTermView:goToEndOfLine(skip_callback)
     local ls = self._vt_line_start or 0
     local n, sent = #self.charlist, self._vt_sent
     self.charpos = (n > sent) and (sent - ls + 1) or (n - ls + 1)
-    self:sendBytes("\27[F")
+    self:sendBytes(SEQ_END)
 end
 
 function VTermView:scrollUp(skip_callback, lines)
@@ -742,16 +799,20 @@ function VTermView:scrollUp(skip_callback, lines)
         if self._vt_sb:scrollUp(lines or 1) > 0 then self:queueDirty(self:_gridRegion()) end
         return
     end
-    self:sendBytes("\27[5~") -- PageUp
+    self:sendBytes(SEQ_PGUP) -- PageUp
 end
 
 function VTermView:scrollDown(skip_callback, lines)
     if self._vt_sb_mode and self._vt_sb then
-        if self._vt_sb:scrollDown(lines or 1) > 0 then self:queueDirty(self:_gridRegion()) end
-        if not self._vt_sb:isScrolling() then self:queueDirty(self:_gridRegion()) end
+        -- 单次脏化: 滚动有位移 或 已回到底(实时帧) 都要重画, 但两种条件
+        -- 同时成立时只标一次(合并进 queueDirty 本就会做, 这里省一次 _gridRegion 分配)。
+        if self._vt_sb:scrollDown(lines or 1) > 0
+            or not self._vt_sb:isScrolling() then
+            self:queueDirty(self:_gridRegion())
+        end
         return
     end
-    self:sendBytes("\27[6~") -- PageDown
+    self:sendBytes(SEQ_PGDN) -- PageDown
 end
 
 -- 网格整体区域(翻看/手势刷新用)
@@ -766,20 +827,6 @@ function VTermView:_gridRegion()
 end
 
 -- ==================== 方向手势开关 ====================
-
--- 触摸手势实测记录(诊断用): 插件目录存在 geslog.on 即追加写 ges.log
-function VTermView:_gesLog(s)
-    local p = self._vt_plugin_path
-    if not p then return end
-    local f = io.open(p .. "/geslog.on", "r")
-    if not f then return end
-    f:close()
-    local g = io.open(p .. "/ges.log", "a")
-    if g then
-        g:write(os.date("%H:%M:%S"), " ", s, "\n")
-        g:close()
-    end
-end
 
 -- 开启后: 网格内左/右/上/下滑 = 方向键; 滑完按住不放 = 连续重复
 function VTermView:setArrowGestures(enable)
@@ -796,21 +843,13 @@ function VTermView:setArrowGestures(enable)
             match = function(_, gs)
                 -- ⚠️ 必须先按事件名过滤(内置 GestureRange:match 的第一职责):
                 -- 漏掉会把 tap 等其它手势"吃掉"——⇆ 开启后网格区触摸全失灵。
-                local hit = false
-                local pos_s, start_s = "nil", "nil"
-                if gs.ges == ges_name then
-                    local r = self.dimen and self:_gridRegion()
-                    if r then
-                        if gs.pos and r:contains(gs.pos) then hit = true end
-                        if not hit and gs.start_pos and r:contains(gs.start_pos) then hit = true end
-                        if not hit and gs.end_pos and r:contains(gs.end_pos) then hit = true end
-                    end
-                    if gs.pos then pos_s = gs.pos.x .. "," .. gs.pos.y end
-                    if gs.start_pos then start_s = gs.start_pos.x .. "," .. gs.start_pos.y end
-                end
-                self:_gesLog(string.format("match want=%s got=%s pos=%s start=%s hit=%s",
-                    ges_name, tostring(gs.ges), pos_s, start_s, tostring(hit)))
-                return hit
+                if gs.ges ~= ges_name then return false end
+                local r = self.dimen and self:_gridRegion()
+                if not r then return false end
+                if gs.pos and r:contains(gs.pos) then return true end
+                if gs.start_pos and r:contains(gs.start_pos) then return true end
+                if gs.end_pos and r:contains(gs.end_pos) then return true end
+                return false
             end,
         }
     end
@@ -858,14 +897,10 @@ function VTermView:_arrowSeq(direction)
     -- south_east)——真机 ges.log 实证 3002 次 pan 的方向全是罗盘词, 一个
     -- down/up/left/right 都没有; 只认后者则方向键永远发不出去。
     if not direction then return nil end
-    local map = {
-        north = "\27[A", south = "\27[B", east = "\27[C", west = "\27[D",
-        up = "\27[A", down = "\27[B", right = "\27[C", left = "\27[D",
-    }
-    if map[direction] then return map[direction] end
+    if ARROW_MAP[direction] then return ARROW_MAP[direction] end
     -- 对角(northeast/southwest...)取主轴, 垂直轴优先(终端 ↑/↓ 最常用)
-    for _, k in ipairs({ "north", "south", "east", "west", "up", "down", "right", "left" }) do
-        if direction:find(k, 1, true) then return map[k] end
+    for _, k in ipairs(ARROW_AXES) do
+        if direction:find(k, 1, true) then return ARROW_MAP[k] end
     end
     return nil
 end
@@ -894,28 +929,61 @@ end
 --   ⇆开 + ⇕开 → 本地历史翻页一屏(等效 Shift+PageUp/PageDown, 见 _vtAction);
 --   ⇆开 + ⇕关 → 带连发的方向手势(见 _vtAction)。
 -- 返回闭包, nil=该方向无动作。
+-- 手势语义表(用户定稿 2026-11-10):
+--   ⇆ 关(无 ⇕/Shift)                  → mouse(点击/拖拽/滚轮)
+--   仅 ⇆ 开                            → 上下/左右 = arrow key
+--   (Shift+⇆开) 或 ⇕ 开                → 上/下 = PgUp/PgDn, 左/右 = Home/End
+--   (⇆开+⇕开) 或 (Shift+⇕开)          → 上/下 = scroll(本地翻历史屏幕)
+-- 判定顺序(自上而下首个命中): scroll → PgUp/PgDn → arrow → mouse。
+-- 返回闭包, nil=该方向无动作。
 function VTermView:_pageAction(direction)
     if not direction then return nil end
     if self._vt_arrows then return nil end -- ⇆ 开启: 手势归 _vtAction
     local is_up = direction:find("north", 1, true) or direction:find("up", 1, true)
     local is_down = direction:find("south", 1, true) or direction:find("down", 1, true)
-    if not (is_up or is_down) then return nil end
-    if self._vt_sb_mode then
-        -- ⇕ 开: 远端翻页键(PuTTY 的 PageUp/PageDown)。软键盘 Shift 挂起时
-        -- 发修饰变体(Shift+PgUp/Dn = \27[5;2~/\27[6;2~), 与 Ctrl+键同理
-        -- (修饰与输入组合); Shift 不在此消耗——下一次打字由键盘自身消化。
+    local is_left = direction:find("west", 1, true) or direction:find("left", 1, true)
+    local is_right = direction:find("east", 1, true) or direction:find("right", 1, true)
+    if not (is_up or is_down or is_left or is_right) then return nil end
+    local shift = self:_hasShift()
+    local arrows = self._vt_arrows
+    local sb = self._vt_sb_mode
+    -- 上下滑判定
+    if is_up or is_down then
+        if sb and (arrows or shift) then
+            -- scroll: 本地翻历史一屏
+            local page = math.max(1, self.rows - 1)
+            return function()
+                if is_up then self:scrollUp(nil, page) else self:scrollDown(nil, page) end
+            end
+        end
+        if sb or (shift and arrows) then
+            -- PgUp/PgDn
+            return function()
+                self:_ensureLive()
+                self:sendBytes(is_up and SEQ_PGUP or SEQ_PGDN)
+            end
+        end
+        return nil -- ⇆ 关: 手势归 mouse
+    end
+    -- 左右滑判定(用户修正 2026-11-10):
+    --   仅 ⇕ 开(⇆关) / ⇆+⇕ 都开 → ←/→ arrow
+    --   Shift+⇆(⇕关) / Shift+⇕ → Home/End
+    --   其余(⇆关无修饰) → mouse
+    if shift then
+        -- Home/End
         return function()
             self:_ensureLive()
-            local mod = ""
-            if self:_hasShift() then mod = ";2" end
-            self:sendBytes(is_up and ("\27[5" .. mod .. "~") or ("\27[6" .. mod .. "~"))
+            self:sendBytes(is_left and SEQ_HOME or SEQ_END)
         end
     end
-    -- 二者皆关: 方向键逐行(经 upLine/downLine 维护行中光标模型)
-    return function()
-        self:_ensureLive()
-        if is_up then self:upLine() else self:downLine() end
+    if sb then
+        -- ←/→ arrow(⇕开⇆关; ⇆开时归 _vtAction 到不了这里; 经 leftChar/rightChar 维护行中光标模型)
+        return function()
+            self:_ensureLive()
+            if is_left then self:leftChar() else self:rightChar() end
+        end
     end
+    return nil
 end
 
 -- ⇆ 关时的 pan 入口: 墨水屏慢速拖动走 pan 流(不是 swipe), 一次拖动只发一发。
@@ -930,27 +998,52 @@ function VTermView:_pagePan(ges)
     return true
 end
 
+-- ⇕ 开 + ⇆ 关(sb-only): pan/swipe 复用 ⇆开 的连发状态机, 但上下滑发裸
+-- PgUp/PgDn(不走本地 scroll); ⇆ 开时 sb_only 恒 false(交给 ⇕ 决定
+-- scroll/PgUp)。⇆开+⇕开 上/下滑 = 本地翻页, 仍走 scroll 分支。
+function VTermView:_sbOnlyMode()
+    return self._vt_sb_mode and not self._vt_arrows
+end
+
 -- ⇕(sb_mode)开启时上下滑=本地翻页一屏(等效 PageUp/PageDown, 不动 PTY);
 -- 其余方向发方向键(发前滚回实时帧)。返回闭包, nil=该方向无动作。
 -- swipe/pan/连发三处共用本解析, 保证"上下滑动逻辑与左右滑动一致"。
-function VTermView:_vtAction(direction)
+-- sb_only=true(⇕开+⇆关): 上下滑跳过 scroll 分支改发裸 PgUp/PgDn。
+function VTermView:_vtAction(direction, sb_only)
     if not direction then return nil end
     local is_up = direction:find("north", 1, true) or direction:find("up", 1, true)
     local is_down = direction:find("south", 1, true) or direction:find("down", 1, true)
     if is_up or is_down then
-        -- 左右滑动使能后: Shift 挂起 + 上/下滑 = PageUp/PageDown(\27[5~ / \27[6~)
-        if self:_hasShift() then
-            local seq = is_up and "\27[5~" or "\27[6~"
+        -- ⇆开+⇕开: 上下滑=本地翻页一屏查看历史(用户定稿 2026-11-10 恢复);
+        -- sb_only(⇕开+⇆关) / Shift 挂起: 发远端 PageUp/PageDown(\27[5~/\27[6~)
+        if self._vt_sb_mode and self._vt_sb and not sb_only then
+            local page = math.max(1, self.rows - 1) -- 少留一行衔接上下文
+            return function()
+                if is_up then self:scrollUp(nil, page) else self:scrollDown(nil, page) end
+            end
+        end
+        if sb_only or self:_hasShift() then
+            local seq = is_up and SEQ_PGUP or SEQ_PGDN
             return function()
                 self:_ensureLive()
                 self:sendBytes(seq)
             end
         end
-        if self._vt_sb_mode and self._vt_sb then
-            local page = math.max(1, self.rows - 1) -- 少留一行衔接上下文
+    end
+    -- 左右滑(用户修正 2026-11-10): Shift 挂起 = Home/End; ⇕开/无修饰 = ←/→ arrow
+    local is_left = direction:find("west", 1, true) or direction:find("left", 1, true)
+    local is_right = direction:find("east", 1, true) or direction:find("right", 1, true)
+    if is_left or is_right then
+        if self:_hasShift() then
             return function()
-                if is_up then self:scrollUp(nil, page) else self:scrollDown(nil, page) end
+                self:_ensureLive()
+                self:sendBytes(is_left and SEQ_HOME or SEQ_END)
             end
+        end
+        -- ←/→ arrow(经 leftChar/rightChar 维护行中光标模型)
+        return function()
+            self:_ensureLive()
+            if is_left then self:leftChar() else self:rightChar() end
         end
     end
     local seq = self:_arrowSeq(direction)
@@ -959,9 +1052,9 @@ function VTermView:_vtAction(direction)
         -- (charpos), 直发裸序列会绕过模型导致后续插入错位
         return function()
             self:_ensureLive()
-            if seq == "\27[D" then self:leftChar()
-            elseif seq == "\27[C" then self:rightChar()
-            elseif seq == "\27[A" then self:upLine()
+            if seq == SEQ_LEFT then self:leftChar()
+            elseif seq == SEQ_RIGHT then self:rightChar()
+            elseif seq == SEQ_UP then self:upLine()
             else self:downLine() end
         end
     end
@@ -969,10 +1062,9 @@ function VTermView:_vtAction(direction)
 end
 
 function VTermView:onVTermSwipe(_, ges)
-    self:_gesLog("SWIPE dir=" .. tostring(ges.direction) .. " arrows=" .. tostring(self._vt_arrows))
     -- 鼠标模式(⇆ 关): 拖动未完=抬起收尾; 否则上下滑=滚轮(vim 滚屏)。
     -- ⇆ 开: 滑动归普通键(方向/翻页), 不做鼠标
-    if self:_mouseActive() and not self._vt_arrows then
+    if self:_mouseActive() and not self._vt_arrows and not self._vt_sb_mode then
         if self._vt_mouse_down then
             self:_mouseSend(0, false, self._vt_mouse_down)
             self._vt_mouse_down = nil
@@ -991,17 +1083,19 @@ function VTermView:onVTermSwipe(_, ges)
     end
     -- ⇆ 关闭时上下滑=↑/↓(⇕关) 或 PgUp/PgDn(⇕开), 一次滑动一发, 其余方向不消费。
     -- pan 流(慢速拖动)可能已经发过本手势的一发: _vt_page_dir 去重, 收尾不补发。
-    if not self._vt_arrows then
+    if not self._vt_arrows and not self._vt_sb_mode then
         local act = self:_pageAction(ges.direction)
         local already = self._vt_page_dir ~= nil
         if act and not already then act() end
         self._vt_page_dir = nil -- 手势结束, 下次拖动重新计
         return act ~= nil or already
     end
-    -- swipe 的 pos 是滑动起点: pan 流已发过键(方向状态在)就不再补发,
-    -- 否则一次滑动方向键双发(违反"一次滑动一发")。
+    -- ⇆开 / ⇕开(⇆关) 共用的连发状态机收尾: pan 流已发过键(_vt_arrow_dir 在)
+    -- 就不再补发, 否则一次滑动方向键双发(违反"一次滑动一发")。
+    -- ⇕开+⇆关 → sb_only=true(上下=PgUp/PgDn, 左右=←/→ 且滑停连发);
+    -- ⇆开+⇕开 → sb_only=false(上下=本地 scroll)。
     if not self._vt_arrow_dir then
-        local act = self:_vtAction(ges.direction)
+        local act = self:_vtAction(ges.direction, self:_sbOnlyMode())
         if act then act() end
     end
     -- swipe = 手指已抬起(手势结束): 作废 pan 流遗留的停顿计时——
@@ -1012,21 +1106,22 @@ function VTermView:onVTermSwipe(_, ges)
 end
 
 function VTermView:onVTermHoldPan(_, ges)
-    self:_gesLog("HOLDPAN dir=" .. tostring(ges.direction) .. " cur=" .. tostring(self._vt_arrow_dir))
     -- 连发存活判据的时间源: 只要 pan 事件还在来(含静止噪声)就证明手指还在。
     -- ⚠️fts 微秒值, 时钟回调里与 time.s() 比较
     self._vt_last_ges_fts = time.now()
     -- 鼠标模式(⇆ 关): 按住移动 = button-1 motion(拖动选区/滚动)。首个
     -- hold_pan 处建立按下状态(touch 无 pos, _vt_mouse_down 只能在这里初始化)
-    if self:_mouseActive() and not self._vt_arrows and ges.pos and not self._vt_collapsed then
+    if self:_mouseActive() and not self._vt_arrows and not self._vt_sb_mode
+        and ges.pos and not self._vt_collapsed then
         local p = ges.pos
         local grid = self:_gridRegion()
         if p and grid and grid:contains(p) and self.pty.mouse_drag then
             local cell = self:_mouseCell(p)
+            self._vt_last_cell = cell -- 最近触摸格子("右键"按钮发送点)
             if not self._vt_mouse_down then
                 self._vt_mouse_down = cell
-                self._vt_mouse_btn = 0
-                self:_mouseSend(0, true, cell)
+                self._vt_mouse_btn = self._vt_mouse_btn or 0
+                self:_mouseSend(self._vt_mouse_btn, true, cell)
             end
             if cell.col ~= self._vt_mouse_down.col or cell.row ~= self._vt_mouse_down.row then
                 local btn = self._vt_mouse_btn or 0
@@ -1036,12 +1131,14 @@ function VTermView:onVTermHoldPan(_, ges)
         end
         return true
     end
-    if not self._vt_arrows then
-        -- ⇆ 关: 慢速拖动也只发一发(↑/↓ 或 PgUp/PgDn), 不做连发/换向状态机
+    if not self._vt_arrows and not self._vt_sb_mode then
+        -- ⇆ 关+⇕ 关: 慢速拖动也只发一发(↑/↓ 或 PgUp/PgDn), 不做连发/换向状态机
         return self:_pagePan(ges)
     end
+    -- ⇆开 / ⇕开(⇆关) 共用连发状态机(滑停 1s 持续触发, 左右=←/→ arrow)。
+    -- sb_only 让 ⇕开+⇆关 的上下滑发裸 PgUp/PgDn 而非本地 scroll。
     local dir = ges.direction
-    local act = dir and self:_vtAction(dir)
+    local act = dir and self:_vtAction(dir, self:_sbOnlyMode())
     if not act then return true end
     -- 位置稳定判定: 与上次记录相距 < STABLE_PX 视为手指停住(触摸噪声/手抖——
     -- 真机 ges.log 实证按住不动时 pos 每帧仍微动 1~4px, pan 事件流永不静默,
@@ -1052,7 +1149,6 @@ function VTermView:onVTermHoldPan(_, ges)
     -- 且拖进键盘的动作不是 tap, 删除键会失效。
     local grid = self:_gridRegion()
     if p and grid and not grid:contains(p) then
-        self:_gesLog("OUT-OF-GRID stop pos=" .. p.x .. "," .. p.y)
         self:_stopArrowRepeat()
         return true
     end
@@ -1122,12 +1218,6 @@ end
 -- 恒真 → 暴涨连发(设备实测 2 秒 200+ 发)。scheduleIn 收的则是**秒**(float)。
 function VTermView:_startRepeatClock()
     if self._vt_repeat_task then return end
-    -- 记录连发方向的单位向量: 停住期间噪声位移用它判"是否转向"
-    local seq = self:_arrowSeq(self._vt_arrow_dir)
-    self._vt_rep_dir_v = seq == "\27[A" and { x = 0, y = -1 }
-        or seq == "\27[B" and { x = 0, y = 1 }
-        or seq == "\27[C" and { x = 1, y = 0 }
-        or { x = -1, y = 0 }
     local base = self._vt_still_since or time.now()
     -- 时钟实例代号: 只有当前代号的任务才允许继续排下一拍。
     -- ⚠️不能只靠 _vt_repeat_task ~= nil 互斥——回调里先置 nil 再重排,
@@ -1139,7 +1229,8 @@ function VTermView:_startRepeatClock()
     local fn
     fn = function()
         if self._vt_repeat_tok ~= tok then return end -- 已被停止/取代
-        if not self._vt_arrows or not self._vt_arrow_dir then return end
+        -- 连发存活判据: ⇆开 或 ⇕开(⇆关) 都允许; 两者皆关(纯 mouse 模式)则停。
+        if not (self._vt_arrows or self._vt_sb_mode) or not self._vt_arrow_dir then return end
 
         -- 抬手检测(首行守卫): 真机抬手后 release 事件可能整体丢失,
         -- 静默超过 0.5s 说明手指已不在屏幕上, 立即自杀叫停连发
@@ -1164,7 +1255,7 @@ function VTermView:_startRepeatClock()
             UIManager:scheduleIn(self.REPEAT_PERIOD, fn)
             return
         end
-        local rep = self:_vtAction(dir)
+        local rep = self:_vtAction(dir, self:_sbOnlyMode())
         if rep then rep() end
         self._vt_last_send_t = time.now()
         -- 下一拍按"起点 + n×周期"对齐, 漂移不累积
@@ -1189,15 +1280,8 @@ function VTermView:_stopRepeatClock()
 end
 
 function VTermView:onVTermHoldPanRelease(_, ges)
-    self:_gesLog("RELEASE")
     -- 鼠标模式: 拖动结束 = 抬起
-    if self:_mouseActive() and self._vt_mouse_down then
-        local btn = self._vt_mouse_btn or 0
-        self:_mouseSend(btn, false, self._vt_mouse_down)
-        self._vt_mouse_down = nil
-        self._vt_mouse_btn = nil
-        return true
-    end
+    if self:_mouseRelease() then return true end
     self:_stopArrowRepeat()
     self._vt_page_dir = nil -- ⇆关: 手势结束, 下次拖动重新计
     self._vt_last_pan_pos = nil -- 位置基准清零, 下次拖动重新建立
@@ -1210,16 +1294,17 @@ function VTermView:onVTermTouch(_, ges)
     self._vt_page_dir = nil -- 新触摸=上一次拖动会话结束(⇆关翻页去重标记)
     -- 鼠标模式(⇆ 关): 网格内按下 = button-1 press(vim 收到即跟随光标)。
     -- ⇆ 开: 不发 press——滑动已让位普通键, 按下会残留拖拽态
-    if self:_mouseActive() and not self._vt_arrows and not self._vt_collapsed and ges.pos then
+    if self:_mouseActive() and not self._vt_arrows and not self._vt_sb_mode
+        and not self._vt_collapsed and ges.pos then
         local r = self:_gridRegion()
         if r:contains(ges.pos) then
             self:_ensureLive()
             self._vt_mouse_down = self:_mouseCell(ges.pos)
+            self._vt_last_cell = self._vt_mouse_down -- 最近触摸格子("右键"按钮发送点)
             self:_mouseSend(0, true, self._vt_mouse_down)
         end
     end
     if self._vt_arrow_dir or self._vt_repeat_task or self._vt_last_pan_pos then
-        self:_gesLog("TOUCH-reset")
         self:_stopArrowRepeat()
         self._vt_last_pan_pos = nil
     end
@@ -1266,19 +1351,23 @@ end
 -- 光标移动不再脏化新旧两整行(滚动输出时的频闪主因): 只脏新旧两格的窄条。
 -- 输出场景 damage 已覆盖所在行, bbox 合并后窄条不放大刷新区; 纯回车/退格
 -- 这类无 damage 的移动就只剩两格窄条, e-ink 刷新面积从两行降到两格。
+-- 文件局部助手: 定义一次, 每次 movecursor 回调零额外闭包/表分配。
+local function dirtyCursorCell(view, ox, oy, cw, ch, r, c)
+    if r >= 0 and r < view.rows and c >= 0 and c < view.cols then
+        view:queueDirty(Geom:new{
+            x = ox + c * cw,
+            y = oy + r * ch,
+            w = cw, h = ch,
+        })
+    end
+end
+
 function VTermView:cursorMoved(old_row, old_col, row, col)
     local off = self._inner_off
     local ox, oy = self.dimen.x + off, self.dimen.y + off
-    for _, rc in ipairs({ { old_row, old_col }, { row, col } }) do
-        local r, c = rc[1], rc[2]
-        if r >= 0 and r < self.rows and c >= 0 and c < self.cols then
-            self:queueDirty(Geom:new{
-                x = ox + c * self.cell_w,
-                y = oy + r * self.cell_h,
-                w = self.cell_w, h = self.cell_h,
-            })
-        end
-    end
+    local cw, ch = self.cell_w, self.cell_h
+    dirtyCursorCell(self, ox, oy, cw, ch, old_row, old_col)
+    dirtyCursorCell(self, ox, oy, cw, ch, row, col)
 end
 
 -- e-ink 防频闪: 80ms 合并窗口, 把连续的 damage/光标移动/输入条刷新
@@ -1451,38 +1540,6 @@ function VTermView:paintTo(bb, x, y)
             local cur_x = gx + cur_pos.col * cell_w
             local cur_y = gy + cur_pos.row * cell_h
             bb:invertRect(cur_x, cur_y, cell_w, cell_h)
-        end
-    end
-
-    -- 临时探针: 选区高亮排障(/tmp/vt_attr.on 存在时采样整屏属性分布),
-    -- 统计 reverse/下划线/非默认背景色号, 用完删。必须在条带分支提前
-    -- return(bar_h<=0 / 收起)之前, 否则 EN 布局采样不到。
-    if io.open("/tmp/vt_attr.on", "r") then
-        local n_rev, n_ul, n_bg = 0, 0, 0
-        local bg_seen = {}
-        local pc = ffi.new("VTermPos")
-        for r = 0, self.rows - 1 do
-            pc.row = r
-            for c = 0, self.cols - 1 do
-                pc.col = c
-                vt_lib.vterm_screen_get_cell(screen, pc, cell)
-                if cell.attrs.reverse == 1 then n_rev = n_rev + 1 end
-                if cell.attrs.underline == 1 then n_ul = n_ul + 1 end
-                local t = tonumber(cell.bg.type) or 0
-                if bit.band(t, 0x04) == 0 and bit.band(t, 0x01) ~= 0 then
-                    local idx = tonumber(cell.bg.indexed.idx) or -1
-                    n_bg = n_bg + 1
-                    bg_seen[idx] = (bg_seen[idx] or 0) + 1
-                end
-            end
-        end
-        local parts = {}
-        for idx, n in pairs(bg_seen) do parts[#parts + 1] = idx .. "x" .. n end
-        local lf = io.open("/tmp/vt_attr.log", "a")
-        if lf then
-            lf:write(os.date("%H:%M:%S"), " rev=", n_rev, " ul=", n_ul,
-                " bg=", n_bg, " [", table.concat(parts, ","), "]\n")
-            lf:close()
         end
     end
 

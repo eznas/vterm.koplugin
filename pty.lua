@@ -77,6 +77,17 @@ local function dbg(fmt, ...)
     end
 end
 
+-- TRACE 合成/读写探针: 四处逐字相同的 open/format/write/close 收成一个助手。
+-- 布尔门 TRACE 在助手外先判, 关闭时零 string.format 分配、零文件 IO。
+local function tracef(fmt, ...)
+    if not TRACE then return end
+    local f = io.open("/tmp/vt_synth.log", "a")
+    if f then
+        f:write(string.format(fmt, ...), "\n")
+        f:close()
+    end
+end
+
 function PTY.new()
     local self = setmetatable({}, PTY)
     self.master_fd = -1
@@ -293,14 +304,8 @@ function PTY:read()
                     local last = raw:match("([^\n]*)$") or ""
                     last = last:gsub("\27%[[%d;]*[A-Za-z]", "")
                     if #last > 0 and #last < 200 then self.prompt_cols = #last end
-                    if TRACE then
-                        local f = io.open("/tmp/vt_synth.log", "a")
-                        if f then
-                            f:write(string.format("PV raw=%q last=%q pw=%s\n",
-                                raw:sub(1, 40), last, tostring(#last)))
-                            f:close()
-                        end
-                    end
+                    tracef("PV raw=%q last=%q pw=%s",
+                        raw:sub(1, 40), last, tostring(#last))
                     -- 检出块整块放行: 提示符本身必须画到网格上(抑制会吃掉
                     -- "[V]$ " 造成行基准错位 → 后续合成整体偏移)
                     return raw
@@ -319,14 +324,8 @@ function PTY:read()
                 -- (滞留队列反而会把用户敲的真 '?' 顶成汉字) → 全部跳过。
                 return raw
             end
-            if TRACE then
-                local f = io.open("/tmp/vt_synth.log", "a")
-                if f then
-                    f:write(string.format("RD la=%s crp=%s n=%d raw=%q\n",
-                        tostring(self.line_active), tostring(self.cr_pending), n, raw:sub(1, 16)))
-                    f:close()
-                end
-            end
+            tracef("RD la=%s crp=%s n=%d raw=%q",
+                tostring(self.line_active), tostring(self.cr_pending), n, raw:sub(1, 16))
             if SYNTH_ON and self.cr_pending then
                 -- 回车已发: 抑制 lineedit 的尾行重印(真 UTF-8 会话)直到 \n,
                 -- \n 起的执行输出放行
@@ -480,15 +479,9 @@ function PTY:write(data)
         end
         dbg("W %q la=%s q=%d st=%d", data, tostring(self.line_active),
             #self.pending_utf8_chars, #self.line_stack)
-        if TRACE then
-            local f = io.open("/tmp/vt_synth.log", "a")
-            if f then
-                f:write(string.format("W la=%s crp=%s hm=%s sync=%s data=%q\n",
-                    tostring(self.line_active), tostring(self.cr_pending),
-                    tostring(self.hist_mode), tostring(false), data:sub(1, 12)))
-                f:close()
-            end
-        end
+        tracef("W la=%s crp=%s hm=%s sync=%s data=%q",
+            tostring(self.line_active), tostring(self.cr_pending),
+            tostring(self.hist_mode), tostring(false), data:sub(1, 12))
     end
     -- 行字符栈: 仅在 shell 提示符行(line_active)记录已写入字符, 供读侧擦除
     -- 组翻译; 回车后失效, 直到检出提示符标记。vi 等全屏应用内不压栈(它们
@@ -697,14 +690,8 @@ end
 -- 合成重绘: 网格光标移到行首 → 重画整行 → 擦净尾部 → 光标回到行内位置
 -- 不变式: 每次合成后网格光标 = 提示符宽 + 影子行前 scur 个字符的宽度
 function PTY:_emitRepaint(pre, pcur, new, ncur)
-    if TRACE then
-        local f = io.open("/tmp/vt_synth.log", "a")
-        if f then
-            f:write(string.format("R pre=%d/%d new=%d/%d cols=%s pw=%s\n",
-                #pre, pcur, #new, ncur, tostring(self.grid_cols), tostring(self.prompt_cols)))
-            f:close()
-        end
-    end
+    tracef("R pre=%d/%d new=%d/%d cols=%s pw=%s",
+        #pre, pcur, #new, ncur, tostring(self.grid_cols), tostring(self.prompt_cols))
     local wsum = function(list, upto)
         local w = 0
         for i = 1, math.min(upto or 0, #list) do

@@ -18,6 +18,32 @@ local VTermView = require("vterm_view")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local gettext = require("gettext")
 local time = require("ui/time")
+
+-- 从 ButtonTable 按文案(或 id)找按钮: dialog 重建后按钮对象是新的, 调用方
+-- 每次传当前 dialog 的 button_table, 不缓存按钮引用(会指向死按钮)。
+local function findBtnIn(bt, txt)
+    if not bt then return nil end
+    local rows = bt.buttons_layout or bt.buttons or {}
+    for _, row in ipairs(rows) do
+        for _, b in ipairs(row) do
+            if type(b) == "table" and (b.text == txt or b.id == txt) then return b end
+        end
+    end
+end
+
+-- PTY 空闲轮询退避阶梯: {连续空读阈值, 该档轮询间隔秒}。有数据立即回 10ms。
+-- 真机实测旧斜坡(30/50/120/250/400 次空读)要 ~110s 才到 1s 稳态, 期间
+-- ~400 次唤醒; 压缩成 ~12s 到稳态(~60 次唤醒)。只影响远端主动推送的首包
+-- 延迟(封顶仍 1s), 交互回显走 _ptyWriteRoundtrip 不经此轮询。嫌首包慢就
+-- 调大阈值/缩小步长, 改这一张表即可回拨。
+local IDLE_LADDER = {
+    { 60, 1.0 },
+    { 45, 0.5 },
+    { 30, 0.2 },
+    { 18, 0.1 },
+    { 8,  0.05 },
+}
+
 -- 轻量双语: 文案原文即中文; KOReader 界面语言非 zh* 时自动切英文对照表
 -- (中文走 gettext 原样返回; 每次调用现读语言, 菜单重建即切换, 无需重启)
 local EN_STRS = {
@@ -72,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.3.1" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.4.0" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -84,6 +110,7 @@ local VTermPlugin = WidgetContainer:extend{
     view = nil,
     dialog = nil,
     session_mgr = nil,
+    _vt_ctrl_pending = false, -- Ctrl 挂起状态: 存插件单例(view 实例随 dialog 重建分叉, 真机实证)
 }
 
 function VTermPlugin:init()
@@ -673,16 +700,8 @@ end
 function VTermPlugin:_setupArrowHoldRepeat()
     local dlg = self.dialog
     if not dlg or not dlg.button_table then return end
-
     local function findBtn(txt)
-        local bt = dlg.button_table
-        if not bt then return nil end
-        local rows = bt.buttons_layout or bt.buttons or {}
-        for _, row in ipairs(rows) do
-            for _, b in ipairs(row) do
-                if type(b) == "table" and (b.text == txt or b.id == txt) then return b end
-            end
-        end
+        return findBtnIn(dlg.button_table, txt)
     end
 
     local function attach(btn, normal_seq, is_up)
@@ -703,70 +722,89 @@ function VTermPlugin:_setupArrowHoldRepeat()
             if self.view then self.view:sendBytes(normal_seq) end
         end
 
-        -- 登记 touch 手势记录手指初次按下时刻
+        -- Shift 挂起时 ↑/↓ 键改为 PgUp/PgDn(用户定稿 2026-11-09:
+        -- 真机按钮上抬手/按住均无事件流, 按住连发不可靠 → 连发改绑 Shift+↑/↓)
+        local sendKey = function()
+            local v = self.view
+            if v and v._hasShift and v:_hasShift() then
+                sendPg()
+            else
+                sendNormal()
+            end
+        end
+
         if not btn.ges_events then btn.ges_events = {} end
+        -- 登记 touch 手势: 每次新按下清空 _sent_pg(长按只发一发语义的兜底——
+        -- 真机 hold 后 tap 可能不派发, 下一次 touch 是唯一可靠的会话边界)。
         btn.ges_events.TouchSelectButton = {
             GestureRange:new{ ges = "touch", range = btn.dimen }
         }
+        btn.ges_events.VTermBtnPan = {
+            GestureRange:new{ ges = "hold_pan" },
+            GestureRange:new{ ges = "pan" },
+        }
+        btn.onVTermBtnPan = function()
+            return false -- pan 不消费(长按连发已废, 仅保留手势路由形状)
+        end
         btn.onTouchSelectButton = function(s)
-            s._touch_t = time.now()
-            s._holding = true
             s._sent_pg = false
-            s._rep_tok = (s._rep_tok or 0) + 1
             return false
         end
-
         btn.hold_callback = function()
-            btn._holding = true
-            local tok = (btn._rep_tok or 0) + 1
-            btn._rep_tok = tok
-            -- 算准距按下满 1.0s 的剩余等待时间 (默认约 500ms 触发 hold, 补齐至 1s)
-            local G_reader_settings = rawget(_G, "G_reader_settings")
-            local hold_ms = G_reader_settings and G_reader_settings:readSetting("ges_hold_interval_ms") or 500
-            local elapsed = btn._touch_t and time.to_s(time.now() - btn._touch_t) or (hold_ms / 1000.0)
-            local wait_s = math.max(0, 1.0 - elapsed)
-
-            UIManager:scheduleIn(wait_s, function()
-                if btn._rep_tok ~= tok or not btn._holding then return end
-                -- 满 1s 首发 pgup/dn
-                btn._sent_pg = true
-                sendPg()
-                -- 持续按住: 以 5 次/秒 (周期 0.2s) 频率连续发送
-                local rep_fn
-                rep_fn = function()
-                    if btn._rep_tok ~= tok or not btn._holding then return end
-                    sendPg()
-                    UIManager:scheduleIn(0.2, rep_fn)
-                end
-                UIManager:scheduleIn(0.2, rep_fn)
-            end)
+            -- 用户定稿 2026-11-09(终态): 长按↑/↓ = 无条件触发一次 PgUp/PgDn, 无连发。
+            -- ⚠️真机(Kindle Voyage)双重事件黑洞(两轮探针实证): ①抬手 hold_release
+            -- 不派发; ②按住不动零 pan 噪声 → 按住连发/活动性自杀在按钮上均无可靠
+            -- 信号, 唯一安全语义 = 长按只发一发(抬手必然停)。轻点 = 普通方向键
+            -- (Shift 挂起时轻点也是 PgUp/PgDn, 走 sendKey)。
+            btn._sent_pg = true -- 抬手后 callback 不再补发方向键
+            sendPg()
         end
-
+        -- ⚠️Button 内置 HoldReleaseSelectButton 的 GestureRange 带 range=self.dimen:
+        -- 抬起点滑出按钮矩形就收不到 release。放开区域, 无副作用。
         local orig_release = btn.onHoldReleaseSelectButton
         btn.onHoldReleaseSelectButton = function(s, ...)
-            local holding = s._holding
-            s._holding = false
-            s._rep_tok = (s._rep_tok or 0) + 1
-            -- 若在 1s 内松开(介于 hold 触发与 1s 之间), 未发 pgup/dn 则保底发一次普通方向键
-            if holding and not s._sent_pg then
-                sendNormal()
-            end
             if orig_release then return orig_release(s, ...) end
             return true
         end
+        btn.ges_events.HoldReleaseSelectButton = {
+            GestureRange:new{ ges = "hold_release" }
+        }
 
-        local orig_cb = btn.callback
         btn.callback = function()
             if btn._sent_pg then
-                btn._sent_pg = false
+                btn._sent_pg = false -- 长按已发 PgUp/Dn, 抬手触发 tap 时吞掉
                 return
             end
-            if orig_cb then orig_cb() else sendNormal() end
+            -- 轻点: Shift 挂起 → PgUp/PgDn; 否则普通方向键
+            sendKey()
         end
     end
 
     attach(findBtn("↑"), "\27[A", true)
     attach(findBtn("↓"), "\27[B", false)
+end
+
+-- 新建/重建对话框后把开关按钮引用与 view 回调挂回(两处 startTerminal /
+-- _reattachVTerm 逐字重复的块)。按钮对象随 ButtonTable 重建而换, 故只挂当前
+-- dlg 的按钮; Ctrl 状态本体存插件单例, 这里只负责视觉复位与唤回通道。
+function VTermPlugin:_bindViewButtons(view, dlg)
+    self._btn_ctrl = findBtnIn(dlg.button_table, "Ctrl")
+    self._btn_arrow = findBtnIn(dlg.button_table, "⇆")
+    self._btn_sb = findBtnIn(dlg.button_table, "⇕")
+    view._vt_ctrl_btn = self._btn_ctrl -- 供回归套件断言
+    view._vt_on_ctrl_used = function()
+        self:_setBtnGray(self._btn_ctrl, false) -- 打字消费 Ctrl: 同步按钮灰底复位
+        UIManager:setDirty(dlg, "ui")
+    end
+    view._vt_toggle_cb = function() self:_toggleKeyboardBar() end
+end
+
+-- 修饰按钮灰底使能态(与软键盘 Shift 一致: frame.background = LIGHT_GRAY),
+-- 按钮文案常显不加*:
+function VTermPlugin:_setBtnGray(btn, on)
+    if not btn or not btn.frame then return end
+    btn.frame.background = on and Blitbuffer.COLOR_LIGHT_GRAY
+        or Blitbuffer.COLOR_WHITE
 end
 
 function VTermPlugin:startTerminal(session, opts)
@@ -799,13 +837,11 @@ function VTermPlugin:startTerminal(session, opts)
                 callback = function() sendInput("\t") end,
             },
             {
-                text = "Ctrl", -- 激活时加 * (只作用于下一次输入, 用掉自动撤销)
+                text = "Ctrl", -- 挂起一次性修饰(用掉自动撤销)
                 callback = function()
                     if not self.view then return end
-                    self.view._vt_ctrl_pending = not self.view._vt_ctrl_pending
-                    if self._btn_ctrl then
-                        self._btn_ctrl:setText(self.view._vt_ctrl_pending and "Ctrl*" or "Ctrl", self._btn_ctrl.width)
-                    end
+                    self._vt_ctrl_pending = not self._vt_ctrl_pending -- 状态存插件单例(跨 view 重建)
+                    self:_setBtnGray(self._btn_ctrl, self._vt_ctrl_pending)
                     if self.dialog then UIManager:setDirty(self.dialog, "ui") end
                 end,
             },
@@ -824,8 +860,21 @@ function VTermPlugin:startTerminal(session, opts)
                 callback = function() sendInput(":") end,
             },
             {
+                -- Ctrl 挂起后点 "/" = 在最近触摸格子发单次右键(用户定稿 2026-11-10);
+                -- Ctrl 未挂起 = 普通 "/" 字符。
                 text = "/",
-                callback = function() sendInput("/") end,
+                callback = function()
+                    local v = self.view
+                    if v and self._vt_ctrl_pending then
+                        if v:sendRightClick() then
+                            self._vt_ctrl_pending = false
+                            self:_setBtnGray(self._btn_ctrl, false)
+                            if self.dialog then UIManager:setDirty(self.dialog, "ui") end
+                            return
+                        end
+                    end
+                    sendInput("/")
+                end,
             },
             {
                 text = "↑",
@@ -842,7 +891,8 @@ function VTermPlugin:startTerminal(session, opts)
                     if not v then return end
                     v:setArrowGestures(not v._vt_arrows)
                     if self._btn_arrow then
-                        self._btn_arrow:setText(v._vt_arrows and "⇆*" or "⇆", self._btn_arrow.width)
+                        self:_setBtnGray(self._btn_arrow, v._vt_arrows)
+                        self._btn_arrow:setText("⇆", self._btn_arrow.width)
                     end
                     if self.dialog then UIManager:setDirty(self.dialog, "ui") end
                 end,
@@ -854,7 +904,8 @@ function VTermPlugin:startTerminal(session, opts)
                     if not v then return end
                     v._vt_sb_mode = not v._vt_sb_mode
                     if self._btn_sb then
-                        self._btn_sb:setText(v._vt_sb_mode and "⇕*" or "⇕", self._btn_sb.width)
+                        self:_setBtnGray(self._btn_sb, v._vt_sb_mode)
+                        self._btn_sb:setText("⇕", self._btn_sb.width)
                     end
                     if self.dialog then UIManager:setDirty(self.dialog, "ui") end
                 end,
@@ -892,7 +943,7 @@ function VTermPlugin:startTerminal(session, opts)
     local view = self.dialog._input_widget
     self.view = view
     view._vt_local = (session.type ~= "ssh") -- 本地会话需适配 busybox vi 字节级退格
-    view._vt_plugin_path = self.path -- 手势实测记录(geslog.on)的开关/日志路径
+    view._vt_plugin = self -- Ctrl 挂起等跨实例状态存插件单例
     -- 默认态(⇆关)也必须注册基础手势: 否则全新会话里 ⇕ 开启后上下滑无人处理
     -- (以前只有切换过 ⇆ 才会走到 setArrowGestures, 首启默认状态手势全丢)
     view:setArrowGestures(false)
@@ -905,26 +956,7 @@ function VTermPlugin:startTerminal(session, opts)
     -- 所以这里按文字把按钮引用抓回来, 开关状态才能改显示。
     -- 引用挂在 self 上: dialog:toggleKeyboard 重建后按钮对象是新的,
     -- _reattachVTerm 会重抓, 局部 upvalue 捕获会指向死按钮。
-    local function findBtn(txt)
-        local bt = self.dialog.button_table
-        if not bt or not bt.buttons_layout then return nil end
-        for _, row in ipairs(bt.buttons_layout) do
-            for _, b in ipairs(row) do
-                if type(b) == "table" and b.text == txt then return b end
-            end
-        end
-    end
-    self._btn_ctrl = findBtn("Ctrl")
-    self._btn_arrow = findBtn("⇆")
-    self._btn_sb = findBtn("⇕")
-    view._vt_ctrl_btn = self._btn_ctrl -- 供回归套件断言
-    -- Ctrl 是一次性修饰, 用掉后由 view 回调撤掉 *
-    view._vt_on_ctrl_used = function()
-        if self._btn_ctrl then self._btn_ctrl:setText("Ctrl", self._btn_ctrl.width) end
-        if self.dialog then UIManager:setDirty(self.dialog, "ui") end
-    end
-    -- 收起状态(按钮栏+键盘全收)下 tap 网格唤回的通道
-    view._vt_toggle_cb = function() self:_toggleKeyboardBar() end
+    self:_bindViewButtons(view, self.dialog)
     self:_setupArrowHoldRepeat()
 
     -- 4. 初始化底层 libvterm 状态机
@@ -1124,22 +1156,13 @@ function VTermPlugin:schedulePtyRead()
         self._vt_idle_reads = (self._vt_idle_reads or 0) + 1
     end
 
-    -- 空闲退避省电(指数): 有数据 10ms; 之后 50/100/200/500ms→1s 封顶;
-    -- 数据一到即回 10ms。交互回显走 _ptyWriteRoundtrip 不经此轮询,
-    -- 退避只影响远端主动推送的首包延迟, 1s 无感。真机实测: 空闲会话
-    -- 旧逻辑烧 7~11% CPU(keepalive 重置退避), 新逻辑 <1%。
+    -- 空闲退避省电(指数): 有数据 10ms; 空读越多间隔越大, 1s 封顶。
+    -- 交互回显走 _ptyWriteRoundtrip 不经此轮询, 退避只影响远端主动推送的
+    -- 首包延迟(封顶 1s 无感)。阶梯表见文件头 IDLE_LADDER, 一行即可回拨。
     local idle = self._vt_idle_reads or 0
     local delay = 0.01
-    if idle > 400 then
-        delay = 1.0
-    elseif idle > 250 then
-        delay = 0.5
-    elseif idle > 120 then
-        delay = 0.2
-    elseif idle > 50 then
-        delay = 0.1
-    elseif idle > 30 then
-        delay = 0.05
+    for _, step in ipairs(IDLE_LADDER) do
+        if idle > step[1] then delay = step[2] break end
     end
     UIManager:scheduleIn(delay, function()
         self:schedulePtyRead()
@@ -1295,7 +1318,7 @@ function VTermPlugin:_paintOutKeyboard(v)
         local ksz = kb.getSize and kb:getSize()
         if not ksz or not ksz.h or ksz.h <= 0 then return end
         local Screen = Device.screen
-        local d = require("ui/geometry"):new{
+        local d = Geom:new{
             x = 0,
             y = Screen:getHeight() - ksz.h,
             w = Screen:getWidth(),
@@ -1339,7 +1362,6 @@ function VTermPlugin:_patchTitleBar()
     -- 与电量时间开关无关, 关显示后点击刷新仍可用。
     if not rawget(tb, "_vt_tap") then
         local InputContainer = require("ui/widget/container/inputcontainer")
-        local GestureRange = require("ui/gesturerange")
         local tap = InputContainer:new{
             dimen = Geom:new{ x = 0, y = 0, w = tb.width or 0, h = tb.titlebar_height or 40 },
         }
@@ -1488,7 +1510,6 @@ function VTermPlugin:showSettings()
     local DoubleSpinWidget = require("ui/widget/doublespinwidget")
     local CheckButton = require("ui/widget/checkbutton")
     local CenterContainer = require("ui/widget/container/centercontainer")
-    local Size = require("ui/size")
     local dlg
     dlg = DoubleSpinWidget:new{
         title_text = _("终端设置"),
@@ -1643,9 +1664,6 @@ end
 -- (布局真正重排, 键盘/按钮栏空间让给终端网格), 重建后必须重挂终端状态。
 function VTermPlugin:_toggleKeyboardBar()
     if not self.dialog then return end
-    if self.view and self.view._gesLog then
-        self.view:_gesLog("KBTOGGLE kb=" .. tostring(self.dialog:isKeyboardVisible()))
-    end
     self.dialog:toggleKeyboard()
     self:_reattachVTerm()
 end
@@ -1661,27 +1679,10 @@ function VTermPlugin:_reattachVTerm()
     self.view = view
     view._vt_local = (old and old._vt_local) or true
     view._vt_collapsed = not dlg.keyboard_visible
-    view._vt_plugin_path = self.path -- 手势实测记录(geslog.on)的开关/日志路径
+    view._vt_plugin = self -- Ctrl 挂起等跨实例状态存插件单例
 
     -- 按钮引用重抓(ButtonTable 重建了, 旧引用是死按钮)
-    local function findBtn(txt)
-        local bt = dlg.button_table
-        if not bt or not bt.buttons_layout then return nil end
-        for _, row in ipairs(bt.buttons_layout) do
-            for _, b in ipairs(row) do
-                if type(b) == "table" and b.text == txt then return b end
-            end
-        end
-    end
-    self._btn_ctrl = findBtn("Ctrl")
-    self._btn_arrow = findBtn("⇆")
-    self._btn_sb = findBtn("⇕")
-    view._vt_ctrl_btn = self._btn_ctrl
-    view._vt_on_ctrl_used = function()
-        if self._btn_ctrl then self._btn_ctrl:setText("Ctrl", self._btn_ctrl.width) end
-        UIManager:setDirty(dlg, "ui")
-    end
-    view._vt_toggle_cb = function() self:_toggleKeyboardBar() end
+    self:_bindViewButtons(view, dlg)
     self:_setupArrowHoldRepeat()
 
     -- 终端状态机与 IO 闭环挂到新 view(仍是同一个 vt/screen/PTY/scrollback)
@@ -1694,7 +1695,7 @@ function VTermPlugin:_reattachVTerm()
     view._vt_resize_cb = function() self:_applyTerminalSize() end
     view._vt_sb = self._vt_sb
     view._vt_sb_mode = (old and old._vt_sb_mode) or false
-    view._vt_ctrl_pending = (old and old._vt_ctrl_pending) or false
+    -- Ctrl 挂起状态已迁到插件单例(self._vt_ctrl_pending), view 侧经 _vt_plugin 读写
     view._vt_shift_mode = (old and (old._vt_shift_mode or (old.keyboard and old.keyboard.shiftmode))) or false
     if view.keyboard and not view._vt_collapsed and view._vt_shift_mode then
         view.keyboard.shiftmode = true
@@ -1750,14 +1751,15 @@ function VTermPlugin:_reattachVTerm()
 
     -- 开关按钮显示状态恢复
     if self._btn_arrow then
-        self._btn_arrow:setText(view._vt_arrows and "⇆*" or "⇆", self._btn_arrow.width)
+    self:_setBtnGray(self._btn_arrow, view._vt_arrows) -- 灰底使能态(与 Shift 一致)
+        self._btn_arrow:setText("⇆", self._btn_arrow.width)
     end
     if self._btn_sb then
-        self._btn_sb:setText(view._vt_sb_mode and "⇕*" or "⇕", self._btn_sb.width)
+    self:_setBtnGray(self._btn_sb, view._vt_sb_mode) -- 灰底使能态(与 Shift 一致)
+        self._btn_sb:setText("⇕", self._btn_sb.width)
     end
-    if self._btn_ctrl then
-        self._btn_ctrl:setText(view._vt_ctrl_pending and "Ctrl*" or "Ctrl", self._btn_ctrl.width)
-    end
+    self:_setBtnGray(self._btn_ctrl, self._vt_ctrl_pending) -- 灰底使能态(与 Shift 一致)
+    if self._btn_ctrl then self._btn_ctrl:setText("Ctrl", self._btn_ctrl.width) end
 
     -- 行数/列数变化 → resize 终端 + 通知 PTY(内核给前台进程组发 SIGWINCH)。
     -- _vt_prev_grid: 字号重建路径里 old==view(同实例), 须用重建前的网格尺寸比。
@@ -2607,14 +2609,14 @@ function VTermPlugin:_runToolbarSuite()
         return "ok"
     end)
 
-    check("TB3 Ctrl 激活→按钮显示 Ctrl*, 用掉自动复位", function()
+    check("TB3 Ctrl 挂起→按钮灰底, 用掉自动复位(灰底清除)", function()
         local v = self.view
         assert(v._vt_ctrl_btn, "按钮引用未抓到(findBtn 失败)")
-        v._vt_ctrl_pending = true
-        v._vt_ctrl_btn:setText("Ctrl*", v._vt_ctrl_btn.width)
+        v:_setCtrlPending(true)
+        self:_setBtnGray(v._vt_ctrl_btn, true)
         v:_ctrlWrite("c") -- Ctrl 生效: 发 \x03 并触发复位回调
-        assert(not v._vt_ctrl_pending, "Ctrl 应被消费")
-        assert(v._vt_ctrl_btn.text == "Ctrl", "按钮应复位, 实得 " .. tostring(v._vt_ctrl_btn.text))
+        assert(not v:_ctrlPending(), "Ctrl 应被消费")
+        assert(v._vt_ctrl_btn.text == "Ctrl", "按钮文案应保持 Ctrl: " .. tostring(v._vt_ctrl_btn.text))
         return "ok"
     end)
 
@@ -2633,7 +2635,9 @@ function VTermPlugin:_runToolbarSuite()
         assert(v.ges_events.VTermSwipe, "⇆关时 swipe 应保留(上下滑动)")
         assert(v.ges_events.VTermPan and v.ges_events.VTermPanRelease
             and v.ges_events.VTermTouch, "⇆关时 pan/touch 应注册")
-        assert(not v.ges_events.VTermHoldPan, "⇆关时连发状态机应撤销")
+        -- v1.3.1 起 ⇆关也注册 hold_pan/hold_release(长按后滑动补齐, 手势路由修复)
+        assert(v.ges_events.VTermHoldPan and v.ges_events.VTermHoldPanRelease,
+            "⇆关时 hold_pan/hold_release 应保持注册")
         return "ok (swipe+pan 一次一发)"
     end)
 
@@ -3013,18 +3017,16 @@ function VTermPlugin:_runToolbarSuite()
         v:setArrowGestures(false) -- ⇆ 关: swipe/pan 注册, 按 ⇕ 分派
         assert(v.ges_events.VTermSwipe ~= nil, "⇆关时 swipe 注册应保留")
         assert(v.ges_events.VTermPan ~= nil, "⇆关时 pan 应注册(墨水屏慢速拖动)")
-        assert(v.ges_events.VTermHoldPan == nil, "⇆关时连发状态机应摘除")
+        -- v1.3.1 起 ⇆关也注册 hold_pan/hold_release(长按滑动路由补齐)
+        assert(v.ges_events.VTermHoldPan ~= nil, "⇆关时 hold_pan 应保持注册")
         local sent = {}
         local orig = v._vt_write
         v._vt_write = function(s) sent[#sent + 1] = s end
-        -- ⇕ 关: 上滑=↑ 下滑=↓
+        -- ⇕ 关(⇆关): 上下滑归 mouse(无动作, 闭包为 nil) — 用户定稿 2026-11-10
         v._vt_sb_mode = false
         local up = v:_pageAction("north")
         local down = v:_pageAction("south")
-        assert(up and down, "⇕关时上下滑应有方向键动作")
-        up(); down()
-        assert(sent[#sent - 1] == "\27[A" and sent[#sent] == "\27[B",
-            "应发 ↑/↓: " .. tostring(sent[#sent - 1]) .. "/" .. tostring(sent[#sent]))
+        assert(up == nil and down == nil, "⇕关(⇆关)时上下滑应归 mouse(nil)")
         -- ⇕ 开: 上滑=PageUp 下滑=PageDown(远端)
         v._vt_sb_mode = true
         local p_up = v:_pageAction("north")
@@ -3033,8 +3035,11 @@ function VTermPlugin:_runToolbarSuite()
         p_up(); p_down()
         assert(sent[#sent - 1] == "\27[5~" and sent[#sent] == "\27[6~",
             "应发 PageUp/PageDown: " .. tostring(sent[#sent - 1]) .. "/" .. tostring(sent[#sent]))
-        -- 水平方向无动作(不吞左右手势语义)
-        assert(v:_pageAction("east") == nil, "水平滑动不应触发上下滚动")
+        -- ⇕开(⇆关) 左右滑 = ←/→ arrow(用户定稿 2026-11-10)
+        local right = v:_pageAction("east")
+        assert(right ~= nil, "⇕开时左右滑应有 arrow 动作")
+        right()
+        assert(sent[#sent] == "\27[C", "应发 →: " .. tostring(sent[#sent]))
         -- 慢速拖动(pan): 墨水屏的实际手势路径 —— 一次拖动只发一发;
         -- 同手势收尾的 swipe 不得补发; 抬手后新手势才再发。
         sent = {}
@@ -3045,11 +3050,26 @@ function VTermPlugin:_runToolbarSuite()
         v:onVTermPan(nil, { direction = "south" })   -- 新手势: PageDown
         assert(#sent == 2 and sent[1] == "\27[5~" and sent[2] == "\27[6~",
             "pan 一次一发/去重失败: " .. table.concat(sent, "|"))
+        -- ⇕开(⇆关) 左右滑 = ←/→ arrow, 且滑停不离开屏幕能持续触发(用户定稿 2026-11-10):
+        -- 走 ⇆开 同款连发状态机(_vtAction sb_only), 不再走 _pagePan 一次性路径。
+        sent = {}
+        v:onVTermPan(nil, { direction = "west" })   -- 首键: ←
+        v:onVTermPan(nil, { direction = "east" })   -- 换向: →
+        assert(sent[1] == "\27[D" and sent[2] == "\27[C",
+            "⇕开(⇆关)左右滑应发 ←/→: " .. table.concat(sent, "|"))
+        -- 停住起连发时钟: ⇆关 但 ⇕开, 存活判据必须放行(旧代码只认 _vt_arrows 会误停)
+        local Geom23 = require("ui/geometry")
+        local c23 = Geom23:new{ x = 300, y = 300 }
+        v:onVTermPan(nil, { direction = "east", pos = c23 })
+        v:onVTermPan(nil, { direction = "east", pos = c23 }) -- 停住: 起连发时钟
+        assert(v._vt_repeat_task ~= nil, "⇕开(⇆关)滑停应启动连发时钟")
+        assert(v:_sbOnlyMode() == true, "⇕开(⇆关)应命中 sb_only")
+        v:_stopArrowRepeat()
         -- 还原 ⇆ 开启(套件其它用例的假设)
         v._vt_sb_mode = false
         v._vt_write = orig
         v:setArrowGestures(true)
-        return "↑/↓ + 5~/6~ + pan-once + east-nil"
+        return "↑/↓ + 5~/6~ + pan-once + sb-only ←/→ + 停住连发"
     end)
 
     -- TB24 长按终端区: 不弹 InputText 的剪贴板面板(复制/粘贴/全选), 且抬指一并消费
@@ -3074,17 +3094,17 @@ function VTermPlugin:_runToolbarSuite()
         local sent = {}
         local orig = v._vt_write
         v._vt_write = function(s) sent[#sent + 1] = s end
-        v._vt_ctrl_pending = true
+        v:_setCtrlPending(true)
         v:_ctrlWrite("a")
-        v._vt_ctrl_pending = true
+        v:_setCtrlPending(true)
         v:_ctrlWrite("]")
-        v._vt_ctrl_pending = true
+        v:_setCtrlPending(true)
         v:_ctrlWrite("v")
-        v._vt_ctrl_pending = true
+        v:_setCtrlPending(true)
         v:_ctrlWrite("\27[A") -- ESC 序列: 不变换
-        v._vt_ctrl_pending = true
+        v:_setCtrlPending(true)
         v:_ctrlWrite(" ")
-        v._vt_ctrl_pending = false
+        v:_setCtrlPending(false)
         v:_ctrlWrite("x")     -- 无挂起: 透传
         v._vt_write = orig
         assert(sent[1] == "\1" and sent[2] == "\29" and sent[3] == "\22",
@@ -3095,8 +3115,9 @@ function VTermPlugin:_runToolbarSuite()
         return "01/1D/16/esc/00/pass"
     end)
 
-    -- TB26 软键盘 Shift + 翻页手势: Shift 挂起 → \27[5;2~/\27[6;2~, 否则裸序列
-    check("TB26 Shift+翻页手势: Shift 挂起→5;2~/6;2~, 关→裸 5~/6~", function()
+    -- TB26 翻页手势(用户定稿 2026-11-10): ⇕开(⇆关)=裸 5~/6~; ⇆开+⇕关+Shift=裸 5~/6~;
+    -- ⇆开+⇕开=scroll(本地翻页); collapsed 保持 shift 缓存仍发裸序列
+    check("TB26 翻页手势: ⇕开→5~/6~; ⇆开+Shift→5~/6~; ⇆+⇕→scroll", function()
         local v = self.view
         local sent = {}
         local orig = v._vt_write
@@ -3104,26 +3125,26 @@ function VTermPlugin:_runToolbarSuite()
         local kbd = v.keyboard
         v._vt_arrows = false
         v._vt_sb_mode = true
-        v.keyboard = { shiftmode = true }
+        v.keyboard = { shiftmode = false }
         v:_pageAction("north")()
         v:_pageAction("south")()
-        v.keyboard.shiftmode = false
-        v:_pageAction("north")()
-        -- ⇆开+Shift 挂起: 上/下滑发远端 PageUp/PageDown(\27[5~/\27[6~)
+        assert(sent[1] == "\27[5~" and sent[2] == "\27[6~",
+            "⇕开应发裸 5~/6~: " .. table.concat(sent, "|"))
+        -- ⇆开+⇕关+Shift: 裸 PgUp/PgDn
+        sent = {}
+        v._vt_sb_mode = false
         v._vt_arrows = true
         v.keyboard.shiftmode = true
         v:_vtAction("north")()
         v:_vtAction("south")()
+        assert(sent[1] == "\27[5~" and sent[2] == "\27[6~",
+            "Shift+⇆开(⇕关)应发裸 5~/6~: " .. table.concat(sent, "|"))
         v._vt_arrows = false
-        v.keyboard = kbd
-        v._vt_write = orig
-        assert(sent[1] == "\27[5;2~" and sent[2] == "\27[6;2~" and sent[3] == "\27[5~",
-            table.concat(sent, "|"))
-        assert(sent[4] == "\27[5~" and sent[5] == "\27[6~",
-            "vtAction-shift: " .. table.concat(sent, "|", 4))
-
-        -- 全屏收起键盘态模拟: keyboard 无 shiftmode, 但 _vt_shift_mode 保持
+        -- collapsed: keyboard 无 shiftmode, _vt_shift_mode 缓存保持(仍在 stub 区间)
+        -- (sb_mode 关: shift+⇕开=scroll 走本地翻页不经 _vt_write; 此处测 shift+⇆开 裸序列)
+        v._vt_sb_mode = false
         v._vt_collapsed = true
+        v._vt_arrows = true
         v.keyboard = {}
         sent = {}
         v:_vtAction("north")()
@@ -3131,8 +3152,11 @@ function VTermPlugin:_runToolbarSuite()
         assert(sent[1] == "\27[5~" and sent[2] == "\27[6~",
             "collapsed-shift: " .. table.concat(sent, "|"))
         v._vt_collapsed = false
-
-        return "5;2/6;2/plain+vtshift+collapsed"
+        v._vt_arrows = false
+        v._vt_sb_mode = false
+        v.keyboard = kbd
+        v._vt_write = orig
+        return "5~/6~+scroll-table"
     end)
 
     -- TB27 Ctrl+] 经真实键盘入口(长按弹窗同款 keyboard:addChar)诊断:
@@ -3145,14 +3169,14 @@ function VTermPlugin:_runToolbarSuite()
         v._vt_write = function(s) sent[#sent + 1] = s end
         local function st(tag)
             self:_suiteLog(("TB27 %s: cl=%d sent=%d pend=%s ime=%s inst=%s"):format(tag,
-                #v.charlist, v._vt_sent or -1, tostring(v._vt_ctrl_pending),
+                #v.charlist, v._vt_sent or -1, tostring(v:_ctrlPending()),
                 tostring(v._vt_ime_active), tostring(rawget(v, "addChars") ~= nil)))
         end
         for _, layout in ipairs({ "en", "zh_CN" }) do
             v.keyboard:setKeyboardLayout(layout)
             st(layout .. "-before")
             local n0 = #v.charlist
-            v._vt_ctrl_pending = true
+            v:_setCtrlPending(true)
             v.keyboard:addChar("]") -- 长按弹窗选 ] 的同款入口(VirtualKey→addChar)
             st(layout .. "-after")
             sent[#sent + 1] = layout
@@ -3268,7 +3292,7 @@ function VTermPlugin:_runToolbarSuite()
     end)
 
     -- TB37 特殊功能键区长按 ↑/↓ 满 1s 发 PgUp/PgDn，并在持续按住时以 5Hz 连发
-    check("TB37 特殊功能键区长按↑/↓满1s发PgUp/PgDn及5Hz连发", function()
+    check("TB37 长按↑/↓=单发PgUp/PgDn(无连发); 轻点=方向键; Shift+轻点=PgUp/PgDn", function()
         local bt = self.dialog.button_table
         local btn_up, btn_dn
         for _, row in ipairs(bt.buttons_layout or bt.buttons or {}) do
@@ -3285,68 +3309,47 @@ function VTermPlugin:_runToolbarSuite()
         local sent = {}
         local orig_send = v.sendBytes
         v.sendBytes = function(_, seq) sent[#sent + 1] = seq end
+        v._vt_sb_mode = false -- TB26 遗留还原: 防 sendPg 走 scrollUp 而非 sendBytes
+        local hr = btn_up.ges_events.HoldReleaseSelectButton
+        assert(hr and hr[1] and hr[1].ges == "hold_release" and hr[1].range == nil,
+            "HoldReleaseSelectButton 应不限区域(range=nil)")
 
-        -- 1. 普通轻点: 立即发普通方向键
+        -- 1. 轻点: 普通方向键
         sent = {}
         btn_up.callback()
-        assert(#sent == 1 and sent[1] == "\27[A", "轻点↑应发\\27[A: " .. tostring(sent[1]))
+        assert(#sent == 1 and sent[1] == "\27[A", "轻点↑应发\27[A: " .. tostring(sent[1]))
 
+        -- 2. 长按: 无条件单发 PgUp, 且后续 tap 被吞(不双发)
         sent = {}
-        btn_dn.callback()
-        assert(#sent == 1 and sent[1] == "\27[B", "轻点↓应发\\27[B: " .. tostring(sent[1]))
-
-        -- 2. 长按 < 1s 提前抬手: 未达 1s 不发 PgUp, 抬手保底发普通方向键
-        sent = {}
-        btn_up:onTouchSelectButton()
         btn_up.hold_callback()
-        btn_up:onHoldReleaseSelectButton()
-        assert(#sent == 1 and sent[1] == "\27[A", "短长按抬手应保底发方向键: " .. tostring(sent[1]))
+        assert(#sent == 1 and sent[1] == "\27[5~", "长按↑应单发PgUp: " .. tostring(sent[1]))
+        btn_up.callback() -- 抬手 tap: 应被 _sent_pg 吞掉
+        assert(#sent == 1, "长按后的 tap 不应补发")
 
-        -- 3. 长按满 1s: 发送 PgUp (\27[5~), 持续按住以 5Hz (0.2s) 连发
+        -- 3. ↓ 同理: 单发 PgDn
         sent = {}
-        local sched_tasks = {}
-        local orig_scheduleIn = UIManager.scheduleIn
-        UIManager.scheduleIn = function(_, delay, fn)
-            table.insert(sched_tasks, { delay = delay, fn = fn })
-        end
-
-        btn_up:onTouchSelectButton()
-        btn_up.hold_callback()
-        assert(#sched_tasks >= 1, "应调度满 1s 触发任务")
-
-        -- 模拟满 1s 触发
-        local task1 = sched_tasks[#sched_tasks]
-        task1.fn()
-        assert(#sent == 1 and sent[1] == "\27[5~", "满 1s 应首发 PgUp: " .. tostring(sent[1]))
-
-        -- 模拟持续按住: 下一拍 (0.2s)
-        local task2 = sched_tasks[#sched_tasks]
-        task2.fn()
-        assert(#sent == 2 and sent[2] == "\27[5~", "持续按住应连发 PgUp: " .. tostring(sent[2]))
-
-        -- 抬起: 停止连发
-        btn_up:onHoldReleaseSelectButton()
-        local n_before = #sent
-        -- 抬起后再跑之前排入的旧回调应被 token 拦截
-        task2.fn()
-        assert(#sent == n_before, "抬手后连发应立即停止")
-
-        -- 4. 同理验证 ↓ 长按满 1s 发 PgDn (\27[6~)
-        sent = {}
-        sched_tasks = {}
-        btn_dn:onTouchSelectButton()
         btn_dn.hold_callback()
-        sched_tasks[#sched_tasks].fn()
-        assert(#sent == 1 and sent[1] == "\27[6~", "满 1s 应首发 PgDn: " .. tostring(sent[1]))
-        btn_dn:onHoldReleaseSelectButton()
+        assert(#sent == 1 and sent[1] == "\27[6~", "长按↓应单发PgDn: " .. tostring(sent[1]))
+        btn_dn.callback()
+        assert(#sent == 1, "↓ 长按后的 tap 不应补发")
 
-        UIManager.scheduleIn = orig_scheduleIn
+        -- 4. Shift 挂起: 轻点 ↑ 也发 PgUp
+        sent = {}
+        local old_shift = v._vt_shift_mode
+        local old_kbd = v.keyboard
+        v._vt_shift_mode = true
+        v.keyboard = { shiftmode = true }
+        btn_up.callback()
+        assert(#sent == 1 and sent[1] == "\27[5~", "Shift+轻点↑应发PgUp: " .. tostring(sent[1]))
+        v.keyboard = old_kbd
+        v._vt_shift_mode = old_shift
+
         v.sendBytes = orig_send
-        return "arrow-hold-5hz ok"
+        return "arrow-hold-oneshot ok"
     end)
 
-    -- TB38 触摸鼠标使能 + Ctrl 挂起 + 屏幕长按 → 鼠标右键 (btn=2) 按下并抬手释放
-    check("TB38 触摸鼠标使能+Ctrl挂起+屏幕长按→鼠标右键", function()
+    -- TB38 "右键"组合键: Ctrl 挂起后点 "/" = 最近触摸格子发单次右键 + 未使能不发
+    check("TB38 右键组合键: Ctrl挂起点/发右键(最近格子); 鼠标未使能不发", function()
         local v = self.view
         local sent = {}
         local orig_send = v.sendBytes
@@ -3359,48 +3362,52 @@ function VTermPlugin:_runToolbarSuite()
             y = r.y + 4 * v.cell_h + math.floor(v.cell_h / 2),
             w = 1, h = 1,
         }
+        local bt = self.dialog.button_table
+        local btn_slash
+        for _, row in ipairs(bt.buttons_layout or bt.buttons or {}) do
+            for _, b in ipairs(row) do
+                if type(b) == "table" and b.text == "/" then btn_slash = b end
+            end
+        end
+        assert(btn_slash and btn_slash.callback, "未找到 / 按钮")
 
-        -- 场景 A: 鼠标使能但无 Ctrl 挂起 → 屏幕长按不发右键
+        -- 场景 A: 点按 = 左键且记录最近格子
         sent = {}
-        v._vt_ctrl_pending = false
-        v:onHoldTextBox(nil, { pos = c })
-        assert(#sent == 0, "无 Ctrl 挂起时不应发鼠标右键: " .. tostring(sent[1]))
+        v._vt_last_cell = nil
+        v:onTapTextBox(nil, { pos = c })
+        assert(#sent == 2, "点按应发左键按下+释放: " .. #sent)
+        assert(sent[1] == "\27[<0;4;5M" and sent[2] == "\27[<0;4;5m", "左键序列错误: " .. tostring(sent[1]))
+        assert(v._vt_last_cell and v._vt_last_cell.col == 4 and v._vt_last_cell.row == 5, "应记录最近格子")
 
-        -- 场景 B: 鼠标使能 + Ctrl 挂起 → 屏幕长按发出右键按下，抬手发出释放 (btn = 2)
+        -- 场景 B: Ctrl 挂起 + 点 "/" = 在最近格子发右键按下+释放, Ctrl 被消费
         sent = {}
-        local ctrl_cleared = false
-        v._vt_ctrl_pending = true
-        v._vt_on_ctrl_used = function() ctrl_cleared = true end
-        v:onHoldTextBox(nil, { pos = c })
+        self._vt_ctrl_pending = true
+        btn_slash.callback()
+        assert(#sent == 2, "Ctrl+/ 应发右键按下+释放: " .. #sent)
+        assert(sent[1] == "\27[<2;4;5M" and sent[2] == "\27[<2;4;5m", "右键序列错误: " .. tostring(sent[1]))
+        assert(self._vt_ctrl_pending == false, "Ctrl 应被消费")
 
-        -- 校验按下序列与状态
-        assert(#sent == 1, "长按应发右键按下 1 发, 实得: " .. #sent)
-        assert(sent[1] and sent[1]:match("^\27%[<2;%d+;%d+M$"), "右键按下序列错误: " .. tostring(sent[1]))
-        assert(sent[1]:match("^\27%[<2;4;5M$"), "单元格坐标计算错误(col=4,row=5): " .. tostring(sent[1]))
-        assert(v._vt_mouse_btn == 2, "应记录按键为右键(btn=2)")
-        assert(v._vt_ctrl_pending == false, "Ctrl 状态应已被消费")
-        assert(ctrl_cleared == true, "应触发 Ctrl 复位回调")
+        -- 场景 C: Ctrl 未挂起 + 点 "/" = 普通字符
+        sent = {}
+        self._vt_ctrl_pending = false
+        btn_slash.callback()
+        assert(#sent == 1 and sent[1] == "/", "Ctrl 未挂起时 / 应发普通字符: " .. tostring(sent[1]))
 
-        -- 抬手: 触发 onHoldReleaseTextBox
-        v:onHoldReleaseTextBox(nil, {})
-        assert(#sent == 2, "抬手后应累计 2 发(按下+释放), 实得: " .. #sent)
-        assert(sent[2] and sent[2]:match("^\27%[<2;%d+;%d+m$"), "右键释放序列错误: " .. tostring(sent[2]))
-        assert(v._vt_mouse_down == nil and v._vt_mouse_btn == nil, "释放后鼠标按下状态应清空")
-
-        -- 场景 C: 鼠标未使能 + Ctrl 挂起 → 屏幕长按不发右键
+        -- 场景 D: Ctrl 挂起但鼠标未使能 = "/" 退回普通字符
         sent = {}
         v.pty = { mouse_click = false, mouse_drag = false }
-        v._vt_ctrl_pending = true
-        v:onHoldTextBox(nil, { pos = c })
-        assert(#sent == 0, "鼠标未使能时不应发右键")
+        self._vt_ctrl_pending = true
+        btn_slash.callback()
+        assert(#sent == 1 and sent[1] == "/", "未使能时 / 应退普通字符: " .. tostring(sent[1]))
+        assert(self._vt_ctrl_pending == true, "未使能时 Ctrl 不应被消费")
 
         v.pty = oldpty
         v.sendBytes = orig_send
-        return "rclick-sgr ok"
+        return "rclick-ctrl-slash ok"
     end)
 
-    -- TB39 独立右键拖拽选区保持: Ctrl+长按建立右键态 → hold_pan 拖动发送 btn=34 (32+2) → 抬手释放
-    check("TB39 独立右键拖拽选区保持 (btn=34 motion)", function()
+    -- TB39 无修饰左键拖拽: hold_pan 建立左键按下态 → motion 32 → 抬手释放
+    check("TB39 左键拖拽 (motion 32)", function()
         local v = self.view
         local sent = {}
         local orig_send = v.sendBytes
@@ -3408,31 +3415,26 @@ function VTermPlugin:_runToolbarSuite()
         local oldpty = v.pty
         v.pty = { mouse_click = true, mouse_drag = true, mouse_sgr = true }
         local r = v:_gridRegion()
-        local c1 = Geom:new{ x = r.x + 2 * v.cell_w, y = r.y + 2 * v.cell_h, w = 1, h = 1 } -- col=3, row=3
-        local c2 = Geom:new{ x = r.x + 6 * v.cell_w, y = r.y + 4 * v.cell_h, w = 1, h = 1 } -- col=7, row=5
-        local c3 = Geom:new{ x = r.x + 10 * v.cell_w, y = r.y + 8 * v.cell_h, w = 1, h = 1 } -- col=11, row=9
+        local c1 = Geom:new{ x = r.x + 2 * v.cell_w, y = r.y + 2 * v.cell_h, w = 1, h = 1 }
+        local c2 = Geom:new{ x = r.x + 6 * v.cell_w, y = r.y + 4 * v.cell_h, w = 1, h = 1 }
+        local c3 = Geom:new{ x = r.x + 10 * v.cell_w, y = r.y + 8 * v.cell_h, w = 1, h = 1 }
 
-        v._vt_ctrl_pending = true
-        -- 1. 长按建立右键态
-        v:onHoldTextBox(nil, { pos = c1 })
-        assert(#sent == 1 and sent[1] == "\27[<2;3;3M", "右键按下错误: " .. tostring(sent[1]))
-        assert(v._vt_mouse_btn == 2, "应记录右键模式")
+        v:onVTermHoldPan(nil, { pos = c1 })
+        assert(#sent == 1 and sent[1] == "\27[<0;3;3M", "左键按下错误: " .. tostring(sent[1]))
 
-        -- 2. 持续拖动 (hold_pan): 必须发送 32 + 2 = 34 的 motion 序列
         v:onVTermHoldPan(nil, { pos = c2 })
-        assert(#sent == 2 and sent[2] == "\27[<34;7;5M", "右键拖动 motion 错误(应为34): " .. tostring(sent[2]))
+        assert(#sent == 2 and sent[2] == "\27[<32;7;5M", "拖动 motion 错误: " .. tostring(sent[2]))
 
         v:onVTermHoldPan(nil, { pos = c3 })
-        assert(#sent == 3 and sent[3] == "\27[<34;11;9M", "右键拖动第二拍 motion 错误: " .. tostring(sent[3]))
+        assert(#sent == 3 and sent[3] == "\27[<32;11;9M", "第二拍 motion 错误: " .. tostring(sent[3]))
 
-        -- 3. 抬手释放 (hold_release / pan_release)
         v:onVTermHoldPanRelease(nil, {})
-        assert(#sent == 4 and sent[4] == "\27[<2;11;9m", "右键释放错误: " .. tostring(sent[4]))
-        assert(v._vt_mouse_down == nil and v._vt_mouse_btn == nil, "拖拽结束后状态应复位")
+        assert(#sent == 4 and sent[4] == "\27[<0;11;9m", "释放错误: " .. tostring(sent[4]))
+        assert(v._vt_mouse_down == nil and v._vt_mouse_btn == nil, "拖拽后状态应复位")
 
         v.pty = oldpty
         v.sendBytes = orig_send
-        return "rclick-drag-34 ok"
+        return "drag-32 ok"
     end)
 
     -- TB34 会话编辑器链路: 已下线——编辑器 getText/collect/update 全链路

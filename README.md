@@ -25,7 +25,7 @@ vim 9.1 editing a file with CJK text (fullwidth characters wrap correctly at the
 - **Real vim**: statically-linked vim 9.1 (musl), with `:help` (bundled, gzipped docs), `Ctrl+]` tag jumps and proper backspace semantics on UTF-8 text
 - **PuTTY-style SSH manager**: saved sessions with host / port / user / key, connect from the KOReader menu; Dropbear key auth supported
 - **E-ink tuned refresh**: partial refresh with region merging and adaptive throttling, full-screen TUIs automatically switch to a higher-quality waveform, PTY polling backs off to 1 s when idle (<1 % idle CPU)
-- **Touch friendly**: quick-key bar (Esc / Tab / Ctrl / arrows / PgUp / PgDn …), full soft keyboard, swipe & pan gestures for arrows and paging, one-swipe-one-key with hold-to-repeat
+- **Touch friendly**: quick-key bar (`Esc / Tab / Ctrl / ⌨ / : / / / ↑ / ↓ / ⇆ / ⇕ / 退出`) with gray-background toggles; `Ctrl` + `/` sends a right-click at the last touched cell; swipe/pan gestures map to arrow keys, PgUp/PgDn or local history paging according to the ⇆/⇕/Shift state, with hold-to-repeat
 - **Title bar clock & battery**: e-ink friendly (minute-aligned single wake, no polling); toggle in ⚙ Settings; tap the title bar for a full-screen refresh to clear ghosting
 - **Bilingual UI**: automatic English menu when the KOReader UI language is not Chinese
 - **Local scrollback**: 500–5000 lines, flick through history without touching the PTY

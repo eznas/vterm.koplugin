@@ -163,20 +163,14 @@ function SessionMgr:buildLaunchCommand(session)
     local args = {}
 
     local port = tostring(session.port or "22")
-    if bin:find("dbclient") then
-        table.insert(args, "-p")
-        table.insert(args, port)
-        if session.key_path and #session.key_path > 0 then
-            table.insert(args, "-i")
-            table.insert(args, session.key_path)
-        end
-    else
-        table.insert(args, "-p")
-        table.insert(args, port)
-        if session.key_path and #session.key_path > 0 then
-            table.insert(args, "-i")
-            table.insert(args, session.key_path)
-        end
+    -- 两种 SSH 后端共享的 -p <port> / -i <key> 参数(原两分支逐字重复)
+    table.insert(args, "-p")
+    table.insert(args, port)
+    if session.key_path and #session.key_path > 0 then
+        table.insert(args, "-i")
+        table.insert(args, session.key_path)
+    end
+    if not bin:find("dbclient") then
         table.insert(args, "-o")
         -- accept-new: 首连自动记录指纹, 指纹变更仍拒绝(MITM 防护保留);
         -- known_hosts 持久化到插件目录, 避免静默信任任意指纹

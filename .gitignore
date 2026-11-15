@@ -1,16 +1,9 @@
-# runtime / personal data — never commit
-sessions.json
+# 运行时用户数据与调试产物，禁止入库（含 SSH 私钥/服务器会话/屏幕内容）
 keys/
+sessions.json
 *.log
-fb.raw
-*.png
-!docs/*.png
-
-# runtime flags & markers
-imetest.on
-echo.dbg.on
-geslog.on
-native.off
-bin/editor.kind
 *.raw
-*.tgz
+*.png
+*.on
+vimruntime.tgz
+known_hosts

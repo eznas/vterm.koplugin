@@ -98,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.4.0" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.4.1" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -809,6 +809,25 @@ end
 
 function VTermPlugin:startTerminal(session, opts)
     session = session or { type = "local" }
+
+    -- 外部远程节点连接前先检测网络连接状态: 未连接时提示连接 WiFi 并待就绪后回调,
+    -- 避免无网络时 dbclient/ssh 立即报错退出导致终端"闪退"
+    if session.type == "ssh" and not (opts and opts.reuse) then
+        local NetworkMgr = require("ui/network/manager")
+        if NetworkMgr:willRerunWhenConnected(function()
+            self:startTerminal(session, opts)
+        end) then
+            return
+        end
+    end
+
+    -- 上一会话未关先关: 不关会泄漏旧 dialog/pty/vt(dbclient 变僵尸、旧读循环
+    -- 永续扫描新 pty 抢字节), 且旧 drain 关闭链会误杀新会话——休眠唤醒后旧
+    -- 会话必死, 唤醒后"首连闪退、重进正常"即此缺陷。
+    -- 字号等 reuse 重建路径复用现有会话, 不走此分支。
+    if not (opts and opts.reuse) and (self.pty or self.dialog) then
+        self:closeTerminal()
+    end
     self._vt_session = session
 
     local cmd, args = self.session_mgr:buildLaunchCommand(session)
@@ -1133,18 +1152,20 @@ function VTermPlugin:startTerminal(session, opts)
 end
 
 function VTermPlugin:schedulePtyRead()
+    local gen = self._vt_read_gen or 0
     if not self.pty or not self.pty:isAlive() then
-        -- shell 已退出(用户敲 exit / SSH 断开): 排干尾部输出后自动关闭。
+        -- shell 已退出(用户敲 exit / SSH 断开): 同步排干全部尾部输出后立即关闭。
         -- 插件无重连逻辑, 旧行为是静默卡屏。
-        if self.pty then
+        -- ⚠️ 旧版 scheduleIn(0.3, closeTerminal) 关的是 0.3s 后"当时的"
+        -- self.pty/dialog: 休眠唤醒后旧会话死亡挂起该定时器, 用户随即点会话
+        -- 开新终端 → 定时器误杀新会话(终端一闪即关=唤醒后首连"闪退"根因)。
+        -- 子进程已死不再产生新输出, 死循环读到 nil/空即排干, 无需延时。
+        while self.pty do
             local chunk = self.pty:read()
-            if chunk and #chunk > 0 then
-                self:_feedVterm(chunk)
-            end
-            UIManager:scheduleIn(0.3, function()
-                self:closeTerminal()
-            end)
+            if not chunk or #chunk == 0 then break end
+            self:_feedVterm(chunk)
         end
+        self:closeTerminal()
         return
     end
 
@@ -1165,7 +1186,9 @@ function VTermPlugin:schedulePtyRead()
         if idle > step[1] then delay = step[2] break end
     end
     UIManager:scheduleIn(delay, function()
-        self:schedulePtyRead()
+        -- 会话已被关闭/替换(_vt_read_gen 前进)时不得再武装: 否则旧循环读到
+        -- 的是新会话的 pty, 双消费者抢字节(流错乱)且死亡时双重触发关闭链
+        if (self._vt_read_gen or 0) == gen then self:schedulePtyRead() end
     end)
 end
 
@@ -3611,11 +3634,19 @@ function VTermPlugin:closeTerminal()
     self._title_seq = (self._title_seq or 0) + 1
     self._title_info = nil
     self._title_tick_pending = false
+    -- 读循环令牌前进: 挂起的 schedulePtyRead 定时器下次 tick 自行消亡
+    self._vt_read_gen = (self._vt_read_gen or 0) + 1
     if self.pty then
         self.pty:close()
         self.pty = nil
     end
     if self.vt then
+        -- 释放前摘掉 view 引用: 防止任何残余重绘(paintTo 走 view.vt)踩到
+        -- 已 free 的 vterm(UAF 硬崩溃)
+        if self.view then
+            self.view.vt = nil
+            self.view.screen = nil
+        end
         self.vt_lib.vterm_free(self.vt)
         self.vt = nil
         self.screen = nil

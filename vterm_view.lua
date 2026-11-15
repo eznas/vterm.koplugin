@@ -573,6 +573,9 @@ function VTermView:_vtKeyEventEnd(char, before_len)
     for _, ch in ipairs(util.splitToChars(tail)) do
         self:_ctrlWrite(ch)
     end
+    -- 提交即刷条带: 净零提交(无候选预览可删)时本事件无缓冲改动, 不补刷则
+    -- 条带残留上一帧的组词草稿(选中字已发送却仍显示)
+    self:refreshInputBar()
 end
 
 -- 合并式提交已由事件边界(_vtKeyEventEnd)取代, 见 _installInputBoundary 注释
@@ -1555,8 +1558,10 @@ function VTermView:paintTo(bb, x, y)
     if (self.bar_h or 0) <= 0 then return end -- 直通布局: 条带高度已归零
     bb:paintRect(gx, grid_bottom, gw, band_bottom - grid_bottom, Blitbuffer.COLOR_WHITE)
     bb:paintRect(gx, grid_bottom, gw, 2, Blitbuffer.COLOR_LIGHT_GRAY)
-    local draft = (self._vt_bar_line or "")
-        .. table.concat(self.charlist, "", self._vt_sent + 1, #self.charlist)
+    -- 条带只显示当前组词草稿: 已提交字词选中即发送、选中即从条带消失,
+    -- 不残留干扰后续组词(已提交内容以终端网格回显为准)。
+    -- _vt_bar_line 镜像仍维护(行中编辑/退格同步用), 只是不再上屏。
+    local draft = table.concat(self.charlist, "", self._vt_sent + 1, #self.charlist)
     if draft ~= "" then
         local max_w = gw - 8
         local tw = TextWidget:new{ text = draft, face = self.bar_face, fgcolor = Blitbuffer.COLOR_BLACK }

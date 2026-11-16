@@ -98,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.4.1" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.4.2" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -1060,12 +1060,10 @@ function VTermPlugin:startTerminal(session, opts)
     -- "wide"=字符级(utf8 vim, 1 个退格删 1 字), "byte"/缺省=字节级
     -- (busybox vi, 每字节 1 个退格)。运行时探测不可靠(movecursor 被
     -- bridge 合并、回显结构因程序而异), 包装身份最确定。
+    -- ⚠️此处不读快照: 文件在编辑器启动时才写, spawn 时读必过期(首会话先跑
+    -- vim = nil → 误判字节级)。消费点经 PTY:editorByteLevel() 实时读。
     if pty.is_local then
-        local kf = io.open(self.path .. "/bin/editor.kind", "r")
-        if kf then
-            pty.byte_level_editor = not kf:read("*a"):match("wide")
-            kf:close()
-        end -- 无文件: nil → delChar 保守按字节级
+        pty.editor_kind_path = self.path .. "/bin/editor.kind"
     end
     local ok, pid = pty:spawn(cmd, args, view.rows, view.cols, env_vars)
     if not ok then
@@ -1296,7 +1294,7 @@ end
 -- 汉字, 屏上前面的字也消失)。未探测(纯 ASCII 流)时维持旧行为(无害)。
 function VTermPlugin:_feedVterm(chunk)
     if self._vt_local_session and self.pty and not self.pty:lineActive()
-        and self.pty.byte_level_editor ~= false then
+        and self.pty:editorByteLevel() ~= false then
         local carried = self._csi_carry
         self._csi_carry = nil
         if carried then chunk = carried .. chunk end

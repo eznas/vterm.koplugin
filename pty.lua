@@ -106,6 +106,7 @@ function PTY.new()
     self.native_shell = false    -- true=本地 shell 是插件 Unicode busybox(行编辑
                                  -- 回显已是真 UTF-8, 跳过全部抑制/翻译/还原层)
     self.byte_level_editor = nil -- true=字节级编辑器(busybox vi); false=字符级(utf8 vim); nil=保守按字节
+    self.editor_kind_path = nil  -- bin/editor.kind 路径(main 注入; 见 editorByteLevel)
     -- 影子行合成(真机乱码根治): local+line_active 时写侧已知行内容/光标,
     -- 合成网格重绘字节, 读侧抑制 lineedit 回显(其 ? 回显/1 列光标模型与
     -- vterm 2 列汉字错位 = ←/⌫ 乱码根因; 真机 ash 探针实证)
@@ -220,6 +221,24 @@ function PTY:ensureUtf8()
         return true
     end
     return false
+end
+
+-- 当前编辑器退格语义(实时读 bin/editor.kind): 包装脚本在编辑器**启动时**写
+-- (bin/vim=wide, bin/vi=byte), 文件内容永远代表最近启动的编辑器。
+-- ⚠️不能只读 self.byte_level_editor(spawn 时快照): 首会话先跑 vim 时快照为
+-- nil → 被当字节级, 一个 ⌫ 发 #字节 个退格 = vim 里多个汉字一次删光。
+-- 消费点(delChar 粒度 / _feedVterm 列换算门)都只在编辑器内生效, 此时文件
+-- 必已反映当前编辑器; shell 行被 lineActive/isCanonical 门短路, 不付 io.open。
+function PTY:editorByteLevel()
+    if self.editor_kind_path then
+        local kf = io.open(self.editor_kind_path, "r")
+        if kf then
+            self.byte_level_editor = not kf:read("*a"):match("wide")
+            kf:close()
+        end
+    end
+    if self.byte_level_editor == nil then return true end -- 无文件: 保守按字节
+    return self.byte_level_editor
 end
 
 -- 前台是否处于 canonical 行模式(true=shell 在读行; false=raw 全屏应用如 vi)

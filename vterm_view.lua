@@ -708,12 +708,11 @@ function VTermView:delChar()
         -- ⌫ 可能把 sent 减穿 ls, 不钳制则后续 maxpos=0 光标错乱
         if self._vt_sent < ls then self._vt_line_start = self._vt_sent end
         -- 删除语义分派: raw 模式且不在 shell 提示符行 = 全屏编辑器。
-        -- 退格粒度按编辑器实测能力: main 在本地会话首次插入 CJK 时记录网格
-        -- 光标步进 — 宽字符 vim = 2 列(1 个 \x7f 删 1 字), 字节级 busybox vi
-        -- = 3 列(需 #字节 个 \x7f 删净)。未探测(纯 ASCII 会话)时维持 #字节
-        -- 粒度(保守: shell 行/canonical 读仍走 1 个分支, 不受影响)。
-        local byte_level = self.pty and self.pty.byte_level_editor
-        if byte_level == nil then byte_level = true end
+        -- 退格粒度按编辑器身份(bin/editor.kind 实时读, 见 PTY:editorByteLevel):
+        -- 字符级 utf8 vim = 1 个 \x7f 删 1 字; 字节级 busybox vi 需 #字节 个
+        -- \x7f 删净。无文件(nil)保守按字节级。
+        local byte_level = true
+        if self.pty then byte_level = self.pty:editorByteLevel() end
         if self._vt_local and self.pty and not self.pty:isCanonical()
             and not self.pty:lineActive() then
             if byte_level then

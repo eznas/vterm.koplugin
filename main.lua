@@ -98,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.4.2" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.4.3" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -3653,6 +3653,9 @@ function VTermPlugin:closeTerminal()
         UIManager:close(self.dialog)
         self.dialog = nil
     end
+    -- 注销拼音辣条候选出口: 否则引擎增强门控残留, 之后系统输入框的
+    -- inline_code 会被卡在开/关错误状态(view 已销毁, sink 无人再刷新)。
+    if self.view then self.view:_vt_releaseImebar() end
     self.view = nil
 end
 

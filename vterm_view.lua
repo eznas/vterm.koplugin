@@ -173,6 +173,60 @@ function VTermView:init()
     end
     -- 条带高度按布局生效(EN 布局 grid 多吃 1~2 行); init 时无需 resize 回调
     self:_vt_setBarVisible(self._vt_bar_visible)
+    -- 拼音辣条(imebar.koplugin)在场时, 把它的候选出口接到 vterm 自绘条带位:
+    -- 复用引擎增强模式(完整候选/数字选字/翻页/v 模式), 候选串画在本 view 预留
+    -- 的条带上 —— 不新建 widget、不盖功能键。未安装/关闭则无副作用。
+    self:_vt_tryImebar()
+end
+
+-- 检测拼音辣条并注册外部候选出口。sink 把引擎推来的候选串存进 _vt_imebar_text,
+-- 由 paintTo 画进自绘条带(替代原「只画未提交草稿」); 引擎清候选时置空重绘。
+function VTermView:_vt_tryImebar()
+    local api = package.loaded["imebar_api"]
+    if not api or type(api.setExternalSink) ~= "function" then return end
+    if self._vt_imebar_active then return end -- 已注册(布局往返), 别换新 sink
+    local view = self
+    local sink = {
+        setText = function(s, hint)
+            s = (type(s) == "string") and s or ""
+            if view._vt_imebar_text == s and view._vt_imebar_hint == hint then return end
+            view._vt_imebar_text = s
+            view._vt_imebar_hint = hint == true
+            view:refreshInputBar()
+        end,
+    }
+    if api.setExternalSink(sink) then
+        view._vt_imebar_active = true
+    end
+end
+
+-- 注销候选出口(换布局到 EN / 收起终端时): 交还引擎原生路径。
+function VTermView:_vt_releaseImebar()
+    if not self._vt_imebar_active then return end
+    local api = package.loaded["imebar_api"]
+    if api and type(api.setExternalSink) == "function" then
+        api.setExternalSink(nil)
+    end
+    self._vt_imebar_active = nil
+    self._vt_imebar_text = nil
+    self._vt_imebar_hint = nil
+end
+
+-- 条带显示文本:辣条激活时 = 拼音码 + 空格 + 候选串(组合期);无候选时只显码;
+-- v 模式显缓冲正文(不拼码);非激活(原生/EN)显未提交草稿。
+-- 辣条增强模式把拼音码 raw 写进输入框草稿且不发 PTY —— 终端网格与条带候选
+-- 都不含码,这里从引擎活实例取码补显,与辣条「码实时显输入框」信息一致。
+function VTermView:_vtBarDraftText()
+    local ime_text = self._vt_imebar_active and (self._vt_imebar_text or "")
+    if not ime_text then
+        return table.concat(self.charlist, "", self._vt_sent + 1, #self.charlist)
+    end
+    local IME = package.loaded["ui/data/keyboardlayouts/generic_ime"]
+    local live = IME and IME._live
+    local code = (live and not live.v_text and live.imebar_code) or nil
+    if not code or code == "" then return ime_text end
+    if ime_text ~= "" then return code .. " " .. ime_text end
+    return code -- 组合中无候选(自定义码前缀)时也显码
 end
 
 -- 条带按布局自适应: IME 布局保留全高(组词/候选唯一绘制处), 直通布局归零。
@@ -223,6 +277,7 @@ function VTermView:_syncImeWrapper(new_layout)
         local ok, mod = pcall(require, "ui/data/keyboardlayouts/" .. mod_name)
         if ok and mod and mod.wrapInputBox then
             self:_wrapImeFunc() -- VK:init 刚包装完新 IME, 把它的 func 纳入边界
+            self:_vt_tryImebar() -- 切回拼音布局: 重新接辣条候选出口
             self._vt_bar_visible = true
             if self:_vt_setBarVisible(true) and self._vt_resize_cb then
                 self._vt_resize_cb() -- rows 变了: 网格/PTY winsize 同步
@@ -234,6 +289,8 @@ function VTermView:_syncImeWrapper(new_layout)
         kb.uwrap_func()
         kb.uwrap_func = nil
     end
+    -- 切到无 IME 布局: 交还辣条引擎给原生路径(否则增强门控残留, 字母进不了 PTY)
+    self:_vt_releaseImebar()
     -- 关键: 摘掉 IME 后类方法重新裸露, 必须重装兜底边界, 否则 EN 字符
     -- 只进草稿缓冲无人提交, 表现为"切换英文后无法输入"
     self:_installInputBoundary()
@@ -545,9 +602,13 @@ function VTermView:_vtKeyEventEnd(char, before_len)
     -- 终端, 随后 IME 删预览又按"已提交字符"补发退格(vim 里表现为前一个词
     -- 被吃掉)。字母与候选切换键只会刷新候选, 一律不发送。
     local function is_compose_key(c)
-        if not c or #c ~= 1 then return false end
+        if not c then return false end
+        -- →/← 是多字节(3B),必须先于单字节判据匹配;否则辣条增强模式下
+        -- 输入框只留拼音草稿(无 ']' 兜底),翻页键会把草稿冲发进 PTY。
+        if c == "→" or c == "←" then return true end
+        if #c ~= 1 then return false end
         local b = c:byte()
-        return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or c == "→" or c == "←"
+        return (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
     end
     -- 只在 IME 布局生效: EN 直通布局里字母就是真实输入, 逐键必须立刻发
     -- (曾误拦 → 英文打字整串不显示, 只有按空格/回车才吐出来)
@@ -1560,9 +1621,13 @@ function VTermView:paintTo(bb, x, y)
     -- 条带只显示当前组词草稿: 已提交字词选中即发送、选中即从条带消失,
     -- 不残留干扰后续组词(已提交内容以终端网格回显为准)。
     -- _vt_bar_line 镜像仍维护(行中编辑/退格同步用), 只是不再上屏。
-    local draft = table.concat(self.charlist, "", self._vt_sent + 1, #self.charlist)
+    -- 拼音辣条在场时, 显示「拼音码 + 候选串」(见 _vtBarDraftText)。
+    local draft = self:_vtBarDraftText()
     if draft ~= "" then
         local max_w = gw - 8
+        -- ⚠️一律黑字: 本条带刷新走 queueDirty("fast" 波形), 真机 e-ink A2 只刷
+        -- 黑白两级 —— 灰字(COLOR_GRAY)在真机上直接消失(辣条 widget 的灰字
+        -- 走 "ui" 波形所以正常)。提示语义靠 "[En]" 前缀区分, 不靠灰度。
         local tw = TextWidget:new{ text = draft, face = self.bar_face, fgcolor = Blitbuffer.COLOR_BLACK }
         if tw:getSize().w > max_w then
             draft = RenderText:getSubTextByWidth(draft, self.bar_face, max_w - cell_w, false, false) .. "…"

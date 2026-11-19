@@ -1729,6 +1729,11 @@ function VTermPlugin:_reattachVTerm()
     --  不能用空 buttons 重建 — 715 行 getButtonById("keyboard") 会崩。)
     -- 手术改 rows 后与键盘 delta 合并成一次 resize。
     if view._vt_collapsed then
+        -- 收键盘：候选条带位一并归零（否则新 view 仍按全高 bar_h 在分配区底部
+        -- 画白底+细线，叠加已 unmount 的 widget 残影 = 屏幕下方残留一条"字条"）。
+        view._vt_bar_visible = false
+        if view._vt_setBarVisible then view:_vt_setBarVisible(false) end
+        if view._vt_releaseImebar then view:_vt_releaseImebar() end
         local vg = dlg.vgroup
         local tail = vg and vg[#vg]
         if tail and tail ~= self._btns_container then
@@ -1763,6 +1768,10 @@ function VTermPlugin:_reattachVTerm()
     else
         self._btns_container = nil
         self._btns_h = nil
+        -- 展开键盘：恢复候选条带位（新 view 重新 mount 辣条 widget 到这条带位）。
+        view._vt_bar_visible = true
+        if view._vt_setBarVisible then view:_vt_setBarVisible(true) end
+        if view._vt_tryImebar then view:_vt_tryImebar() end -- 恢复 want，paintTo 会重 mount
     end
 
     -- 方向手势开关状态延续(注册到新 view 的 ges_events); 关也要注册——

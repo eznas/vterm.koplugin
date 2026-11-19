@@ -142,12 +142,30 @@ function VTermView:init()
     -- 绝不重叠 —— 候选字永远不遮挡终端输出。条带高度按 CJK 字形实际墨高
     -- + 西文降部预留(字体行高含大量上下留白, 直接用它会把文字顶得离键盘
     -- 很远并白吃一整行); 上沿一条细线紧贴网格末行。
-    local g_cjk = RenderText:getGlyph(self.face_cjk, 0x5019, false) -- 候
-    local g_desc = RenderText:getGlyph(self.face_cjk, 0x67, false)  -- g
-    self.cjk_ink_h = (g_cjk and g_cjk.bb:getHeight()) or math.ceil(self.cell_h * 0.85)
-    self.cjk_ink_t = (g_cjk and g_cjk.t) or math.floor(self.cell_h * 0.7) -- 基线到墨迹顶
-    self.cjk_desc = math.max(0, (g_desc and (g_desc.bb:getHeight() - g_desc.t)) or 0)
-    self.bar_face = self.face_cjk -- 文字大小不变(用户明确要求)
+    -- 字体统一: 拼音辣条(imebar)在场时, 条带改用它的 "cfont" 与它算出的墨高,
+    -- 与辣条自身条带完全一致(用户要求"字体统一/完全用拼音辣条取代内置字条")。
+    -- cfont 是 KOReader 全局资源, Font:getFace("cfont") 与辣条 ImeBar:init 拿的
+    -- 是同一个 face; 辣条未安装时这个 face 仍存在, 视觉退化为"换了个字体",
+    -- 但候选内容/交互不变, 可接受。
+    local ok_face, bar_face = pcall(function() return Font:getFace("cfont") end)
+    if ok_face and bar_face then
+        local g_cjk, g_desc
+        pcall(function()
+            g_cjk = RenderText:getGlyph(bar_face, 0x5019, false)
+            g_desc = RenderText:getGlyph(bar_face, 0x67, false)
+        end)
+        self.bar_face = bar_face
+        self.cjk_ink_h = (g_cjk and g_cjk.bb and g_cjk.bb:getHeight()) or math.ceil(self.cell_h * 0.85)
+        self.cjk_ink_t = (g_cjk and g_cjk.t) or math.floor(self.cell_h * 0.7)
+        self.cjk_desc = math.max(0, (g_desc and g_desc.bb and (g_desc.bb:getHeight() - g_desc.t)) or 0)
+    else
+        local g_cjk = RenderText:getGlyph(self.face_cjk, 0x5019, false) -- 候
+        local g_desc = RenderText:getGlyph(self.face_cjk, 0x67, false)  -- g
+        self.cjk_ink_h = (g_cjk and g_cjk.bb:getHeight()) or math.ceil(self.cell_h * 0.85)
+        self.cjk_ink_t = (g_cjk and g_cjk.t) or math.floor(self.cell_h * 0.7) -- 基线到墨迹顶
+        self.cjk_desc = math.max(0, (g_desc and (g_desc.bb:getHeight() - g_desc.t)) or 0)
+        self.bar_face = self.face_cjk
+    end
     self.bar_h = math.max(6, self.cjk_ink_h + self.cjk_desc + 6)
     self.bar_h_full = self.bar_h -- 条带全高; 非 IME 布局归零给网格腾行
     self.cols = math.max(20, math.floor(self.width / self.cell_w))
@@ -179,37 +197,49 @@ function VTermView:init()
     self:_vt_tryImebar()
 end
 
--- 检测拼音辣条并注册外部候选出口。sink 把引擎推来的候选串存进 _vt_imebar_text,
--- 由 paintTo 画进自绘条带(替代原「只画未提交草稿」); 引擎清候选时置空重绘。
+-- 检测拼音辣条并请求 widget 本体模式。真正的挂载(mountExternal)延迟到
+-- paintTo 拿到本 view 的屏幕绝对坐标后做 —— 锚定矩形需要 dimen.x/y，init 时尚无。
+-- 这里只记下"意图"，避免每次 paintTo 重复调 mount。
 function VTermView:_vt_tryImebar()
     local api = package.loaded["imebar_api"]
-    if not api or type(api.setExternalSink) ~= "function" then return end
-    if self._vt_imebar_active then return end -- 已注册(布局往返), 别换新 sink
-    local view = self
-    local sink = {
-        setText = function(s, hint)
-            s = (type(s) == "string") and s or ""
-            if view._vt_imebar_text == s and view._vt_imebar_hint == hint then return end
-            view._vt_imebar_text = s
-            view._vt_imebar_hint = hint == true
-            view:refreshInputBar()
-        end,
+    if not api or type(api.mountExternal) ~= "function" then return end
+    self._vt_imebar_want = true
+end
+
+-- 在 paintTo 中把辣条 widget 锚到本 view 预留的条带位。矩形 = 条带绘制区
+-- (与 paintTo 白底/细线同一区间)，字体两边都用 cfont 故高度天然一致。
+function VTermView:_vt_mountImebarWidget()
+    if not self._vt_imebar_want or self._vt_imebar_active then return end
+    if not self.dimen or not self.dimen.x then return end -- 还未拿到绝对坐标
+    if (self.bar_h or 0) <= 0 then return end             -- EN 直通布局无条带
+    local api = package.loaded["imebar_api"]
+    if not api or type(api.mountExternal) ~= "function" then return end
+    local off = self._inner_off or 0
+    local gx = self.dimen.x + off
+    local grid_bottom = self.dimen.y + off + self.rows * self.cell_h
+    local avail_h = self.avail_rows_h or (self.rows * self.cell_h)
+    local band_bottom = self.dimen.y + off + avail_h + self.bar_h + off
+    local rect = {
+        x = gx,
+        y = grid_bottom,
+        w = self.cols * self.cell_w,
+        h = math.max(6, band_bottom - grid_bottom),
     }
-    if api.setExternalSink(sink) then
-        view._vt_imebar_active = true
+    local kb = self.keyboard
+    if api.mountExternal(kb, rect) then
+        self._vt_imebar_active = true
     end
 end
 
--- 注销候选出口(换布局到 EN / 收起终端时): 交还引擎原生路径。
+-- 注销 widget(换布局到 EN / 收起终端时): 交还引擎原生路径。
 function VTermView:_vt_releaseImebar()
+    self._vt_imebar_want = nil
     if not self._vt_imebar_active then return end
     local api = package.loaded["imebar_api"]
-    if api and type(api.setExternalSink) == "function" then
-        api.setExternalSink(nil)
+    if api and type(api.unmountExternal) == "function" then
+        api.unmountExternal()
     end
     self._vt_imebar_active = nil
-    self._vt_imebar_text = nil
-    self._vt_imebar_hint = nil
 end
 
 -- 条带显示文本:辣条激活时 = 拼音码 + 空格 + 候选串(组合期);无候选时只显码;
@@ -639,6 +669,41 @@ function VTermView:_vtKeyEventEnd(char, before_len)
     self:refreshInputBar()
 end
 
+-- 触摸选字补提交: 键盘选字经 addChars.func → _vtKeyEventEnd 自动收口发 PTY,
+-- 但触摸(onGesture)直接调引擎 tapSelectCandidate → separate 用 raw_method_call
+-- 写候选字, 绕过事件边界 —— 汉字只进草稿不发, 表现为"点了没上字, 要再按空格"。
+-- 这里把未发草稿尾部一次性发 PTY(逻辑同 _vtKeyEventEnd 行尾提交段)。
+function VTermView:_vtCommitDraft()
+    local after_len = #self.charlist
+    if after_len <= (self._vt_sent or 0) then
+        self:refreshInputBar()
+        return
+    end
+    local ls = self._vt_line_start or 0
+    local tail = table.concat(self.charlist, "", self._vt_sent + 1, after_len)
+    -- 组词中间态(尾 ']')不提交; 选字后 stack 已清空, 正常不会有 ']'
+    if tail:sub(-1) == "]" then
+        self:refreshInputBar()
+        return
+    end
+    local pos = self.charpos or (after_len - ls + 1)
+    local clin = (self._vt_sent or 0) - ls
+    pullToLineTail(self, pos, clin)
+    self._vt_sent = after_len
+    if tail:find("\n", 1, true) or tail:find("\r", 1, true) then
+        self._vt_bar_line = nil
+        self._vt_line_start = after_len
+        self.charpos = 1
+    else
+        self._vt_bar_line = (self._vt_bar_line or "") .. tail
+        self.charpos = after_len - ls + 1
+    end
+    for _, ch in ipairs(util.splitToChars(tail)) do
+        self:_ctrlWrite(ch)
+    end
+    self:refreshInputBar()
+end
+
 -- 合并式提交已由事件边界(_vtKeyEventEnd)取代, 见 _installInputBoundary 注释
 
 -- 刷新候选字条区域: 从网格末行下沿到分配区底(=键盘上沿), 含细线与候选字;
@@ -655,6 +720,23 @@ function VTermView:refreshInputBar()
         h = (avail_h + self.bar_h + off) - self.rows * self.cell_h,
     }
     self:queueDirty(region)
+    -- widget 模式：拼音码画在终端光标处(网格内)，增删码要连带刷掉光标行的
+    -- 旧 preedit 字形，否则残影。组词时光标在末行，标脏整个末行足够且便宜。
+    if self._vt_imebar_active and self.screen and self.vt_lib and self.vt then
+        local state = self.vt_lib.vterm_obtain_state(self.vt)
+        if state then
+            local p = ffi.new("VTermPos")
+            self.vt_lib.vterm_state_get_cursorpos(state, p)
+            if p.row >= 0 and p.row < self.rows then
+                self:queueDirty(Geom:new{
+                    x = self.dimen.x + off,
+                    y = self.dimen.y + off + p.row * self.cell_h,
+                    w = self.cols * self.cell_w,
+                    h = self.cell_h,
+                })
+            end
+        end
+    end
 end
 
 -- Ctrl 修饰 + PTY 写入
@@ -1490,6 +1572,16 @@ function VTermView:paintTo(bb, x, y)
     self.dimen.x = x
     self.dimen.y = y
 
+    -- 辣条 widget 本体模式：首次拿到绝对坐标后延迟挂载(不能在 paintTo 里
+    -- UIManager:show，改 widget 栈要在绘制之外)。nextTick 去重靠 _vt_imebar_active。
+    if self._vt_imebar_want and not self._vt_imebar_active and not self._vt_imebar_mount_pending then
+        self._vt_imebar_mount_pending = true
+        UIManager:nextTick(function()
+            self._vt_imebar_mount_pending = nil
+            if self._vt_imebar_want then self:_vt_mountImebarWidget() end
+        end)
+    end
+
     local off = self._inner_off
     local gx = x + off
     local gy = y + off
@@ -1602,7 +1694,27 @@ function VTermView:paintTo(bb, x, y)
         if cur_pos.row >= 0 and cur_pos.row < self.rows and cur_pos.col >= 0 and cur_pos.col < self.cols then
             local cur_x = gx + cur_pos.col * cell_w
             local cur_y = gy + cur_pos.row * cell_h
-            bb:invertRect(cur_x, cur_y, cell_w, cell_h)
+            local cursor_drawn = false
+            -- 辣条 widget 模式：拼音码 raw 写在 charlist 草稿尾部但不发 PTY，
+            -- 终端网格里看不到。把它作为预编辑覆盖画在光标处(输入窗口显拼音)，
+            -- 候选字则由锚定 widget 画在下方条带 —— 两者分工与系统拼音一致。
+            if self._vt_imebar_active then
+                local IME = package.loaded["ui/data/keyboardlayouts/generic_ime"]
+                local live = IME and IME._live
+                local code = (live and not live.v_text and live.imebar_code) or nil
+                if code and code ~= "" then
+                    -- 先画黑字，光标块移到码末尾 —— 光标块是黑底 invertRect，
+                    -- 若先画它会把 preedit 首字母吃掉（黑字压黑块看不见）。
+                    local tw = TextWidget:new{ text = code, face = self.face_mono,
+                        fgcolor = Blitbuffer.COLOR_BLACK }
+                    local tw_w = tw:getSize().w
+                    tw:paintTo(bb, cur_x, cur_y + baseline - tw:getBaseline())
+                    tw:free()
+                    bb:invertRect(cur_x + tw_w, cur_y, cell_w, cell_h)
+                    cursor_drawn = true
+                end
+            end
+            if not cursor_drawn then bb:invertRect(cur_x, cur_y, cell_w, cell_h) end
         end
     end
 
@@ -1616,12 +1728,17 @@ function VTermView:paintTo(bb, x, y)
     local band_bottom = gy + avail_h + (self.bar_h or 0) + (self._inner_off or 0)
     if self._vt_bar_visible == false then return end
     if (self.bar_h or 0) <= 0 then return end -- 直通布局: 条带高度已归零
+    -- 辣条 widget 本体模式：白底+细线+候选文字全部由 ImeBar widget 在锚定矩形
+    -- 里绘制。这里必须整个退出（连白底/细线都不画）—— 否则与 widget 在完全
+    -- 相同的矩形上双重绘制，还用 fast(A2) 与 ui 两种波形刷同一区域，是残影
+    -- 清不干净的根源。条带白底已由本函数开头的大背景(:1593)铺底，无空洞。
+    if self._vt_imebar_active then return end
     bb:paintRect(gx, grid_bottom, gw, band_bottom - grid_bottom, Blitbuffer.COLOR_WHITE)
     bb:paintRect(gx, grid_bottom, gw, 2, Blitbuffer.COLOR_LIGHT_GRAY)
+    -- 非 widget 模式(EN/原生回退)：仍画草稿条带。
     -- 条带只显示当前组词草稿: 已提交字词选中即发送、选中即从条带消失,
     -- 不残留干扰后续组词(已提交内容以终端网格回显为准)。
     -- _vt_bar_line 镜像仍维护(行中编辑/退格同步用), 只是不再上屏。
-    -- 拼音辣条在场时, 显示「拼音码 + 候选串」(见 _vtBarDraftText)。
     local draft = self:_vtBarDraftText()
     if draft ~= "" then
         local max_w = gw - 8

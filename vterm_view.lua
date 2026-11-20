@@ -33,6 +33,7 @@ local UIManager = require("ui/uimanager")
 local time = require("ui/time")
 local ffi = require("ffi")
 local util = require("util")
+local Screen = require("device").screen
 
 -- 方向/功能键序列常量: 生产路径复用, 免每次手势重建字面量。
 local SEQ_UP, SEQ_DOWN = "\27[A", "\27[B"
@@ -144,10 +145,20 @@ function VTermView:init()
     -- 很远并白吃一整行); 上沿一条细线紧贴网格末行。
     -- 字体统一: 拼音辣条(imebar)在场时, 条带改用它的 "cfont" 与它算出的墨高,
     -- 与辣条自身条带完全一致(用户要求"字体统一/完全用拼音辣条取代内置字条")。
-    -- cfont 是 KOReader 全局资源, Font:getFace("cfont") 与辣条 ImeBar:init 拿的
-    -- 是同一个 face; 辣条未安装时这个 face 仍存在, 视觉退化为"换了个字体",
-    -- 但候选内容/交互不变, 可接受。
-    local ok_face, bar_face = pcall(function() return Font:getFace("cfont") end)
+    -- 字号与 imebar 同 key 同公式(跨插件复制, 改一处须同步另一处): 用户设置
+    -- imebar_font_size(18..64, 菜单可调)优先, 无值则自适应(短边>600 放大、上限
+    -- 64) —— 两边同字号同度量, 字条高度才真正统一(此前 cfont 24 vs 辣条自适应
+    -- 放大导致 219 真机两侧高度不一致)。
+    -- cfont 是 KOReader 全局资源; 辣条未安装时这个 face 仍存在, 视觉退化为
+    -- "换了个字体", 但候选内容/交互不变, 可接受。
+    local G_settings = rawget(_G, "G_reader_settings")
+    local font_saved = G_settings and G_settings:readSetting("imebar_font_size")
+    local bar_base = (type(font_saved) == "number" and font_saved >= 18 and font_saved <= 64)
+        and font_saved or (function()
+            local short = math.min(Screen:getWidth(), Screen:getHeight())
+            return short > 600 and math.min(64, 24 + math.floor((short - 600) / 100)) or 24
+        end)()
+    local ok_face, bar_face = pcall(function() return Font:getFace("cfont", bar_base) end)
     if ok_face and bar_face then
         local g_cjk, g_desc
         pcall(function()
@@ -166,7 +177,8 @@ function VTermView:init()
         self.cjk_desc = math.max(0, (g_desc and (g_desc.bb:getHeight() - g_desc.t)) or 0)
         self.bar_face = self.face_cjk
     end
-    self.bar_h = math.max(6, self.cjk_ink_h + self.cjk_desc + 6)
+    -- 上下留白 0, 与 imebar 的 pad_v=0 对齐(用户要求字条紧贴文字统一高度)。
+    self.bar_h = math.max(1, self.cjk_ink_h + self.cjk_desc)
     self.bar_h_full = self.bar_h -- 条带全高; 非 IME 布局归零给网格腾行
     self.cols = math.max(20, math.floor(self.width / self.cell_w))
     self.avail_rows_h = math.max(self.bar_h, self.height - self.bar_h)
@@ -215,15 +227,23 @@ function VTermView:_vt_mountImebarWidget()
     local api = package.loaded["imebar_api"]
     if not api or type(api.mountExternal) ~= "function" then return end
     local off = self._inner_off or 0
-    local gx = self.dimen.x + off
-    local grid_bottom = self.dimen.y + off + self.rows * self.cell_h
     local avail_h = self.avail_rows_h or (self.rows * self.cell_h)
+    -- 条带下沿保持吃到底(=InputText 底=键盘上沿, 与辣条普通模式同位 —— 辣条
+    -- 就是紧贴键盘顶的), 高度严格 = self.bar_h(与辣条同度量同值, 上下间距 0)。
+    -- 上沿相应下移: 网格末行与条带之间露出网格取整余数的白缝(≤一行字符高)。
+    -- 此前 rect 吃掉网格底以下全部空间(高 20~50px 超辣条); 上一版又紧贴网格
+    -- 导致与软键盘间隙大(用户实测)。两者都对齐辣条: 贴键盘 + bar_h 高。
     local band_bottom = self.dimen.y + off + avail_h + self.bar_h + off
+    -- 横向吃满全屏(x=0, w=屏宽) —— 与辣条普通模式完全同宽同位(placeAbove 非
+    -- 外部路径就是 0/屏宽)。此前用网格矩形, 左边缩进 frame 内边距、右边缩进
+    -- 列数取整余数, 细线到屏幕边缘有明显空隙(用户实测); 文字起点 text_gap
+    -- 两模式一致, 命中矩形随 paintTo 的 x 自适应, 引擎 _imebar_geo 的
+    -- avail_w(按屏宽算) 也恰好对上。
     local rect = {
-        x = gx,
-        y = grid_bottom,
-        w = self.cols * self.cell_w,
-        h = math.max(6, band_bottom - grid_bottom),
+        x = 0,
+        y = band_bottom - math.max(6, self.bar_h),
+        w = Screen:getWidth(),
+        h = math.max(6, self.bar_h),
     }
     local kb = self.keyboard
     if api.mountExternal(kb, rect) then
@@ -712,14 +732,19 @@ function VTermView:refreshInputBar()
     if (self.bar_h or 0) <= 0 then return end -- 直通布局无条带(组词不用)
     if not self.dimen then return end
     local off = self._inner_off
-    local avail_h = self.avail_rows_h or (self.rows * self.cell_h)
-    local region = Geom:new{
-        x = self.dimen.x + off,
-        y = self.dimen.y + off + self.rows * self.cell_h,
-        w = self.cols * self.cell_w,
-        h = (avail_h + self.bar_h + off) - self.rows * self.cell_h,
-    }
-    self:queueDirty(region)
+    -- widget 模式不标脏条带区: 白底/细线/候选全由 ImeBar widget 用 "ui" 波形
+    -- 自刷。这里再标脏会随 _vtFlush 走 fast(A2) 波形重刷同一区域 —— A2 只有
+    -- 黑白两级, 灰色细线直接刷没, 与 widget 的 ui 刷一灭一现 = 输入时细线
+    -- 闪烁(219 真机实测)。非 widget 模式仍需标脏(自绘条带在这里重画)。
+    if not self._vt_imebar_active then
+        local avail_h = self.avail_rows_h or (self.rows * self.cell_h)
+        self:queueDirty(Geom:new{
+            x = self.dimen.x + off,
+            y = self.dimen.y + off + self.rows * self.cell_h,
+            w = self.cols * self.cell_w,
+            h = (avail_h + self.bar_h + off) - self.rows * self.cell_h,
+        })
+    end
     -- widget 模式：拼音码画在终端光标处(网格内)，增删码要连带刷掉光标行的
     -- 旧 preedit 字形，否则残影。组词时光标在末行，标脏整个末行足够且便宜。
     if self._vt_imebar_active and self.screen and self.vt_lib and self.vt then
@@ -1588,9 +1613,15 @@ function VTermView:paintTo(bb, x, y)
     local gw = self.cols * self.cell_w
     local gh = self.rows * self.cell_h
 
-    -- 纯白背景打底(覆盖到条带下沿 = 整个分配区含 InputText 下内边距)
+    -- 纯白背景打底：widget 模式下铺到「条带顶」为止(高度 avail_h + off)，
+    -- 条带区(bar_h)完全交给 ImeBar widget。此前铺到条带下沿，vterm 因网格变化
+    -- 重绘时白底会盖掉 widget 刚画的候选字(两者 paintTo 顺序不固定) → 概率性
+    -- 花屏/闪字(C 排查)。条带顶 = dimen.y+off+avail_h+off = gy+avail_h+off。
+    -- 非 widget 模式(自绘条带)仍需铺到条带下沿。
     local avail_h = self.avail_rows_h or gh
-    bb:paintRect(gx, gy, gw, avail_h + (self.bar_h or 0) + (self._inner_off or 0), Blitbuffer.COLOR_WHITE)
+    local bg_h = (avail_h + (self._inner_off or 0))
+        + ((self._vt_imebar_active and 0) or ((self.bar_h or 0) + (self._inner_off or 0)))
+    bb:paintRect(gx, gy, gw, bg_h, Blitbuffer.COLOR_WHITE)
 
     if not self.screen then return end
 
@@ -1718,14 +1749,14 @@ function VTermView:paintTo(bb, x, y)
         end
     end
 
-    -- 候选字条(独占键盘上方的窄条带: 下沿即按钮行, 无下边线; 上沿细线紧贴
-    -- 网格末行)。仅 IME(zh 系)布局显示候选文字; EN 等直通布局只留白底。
-    local avail_h = self.avail_rows_h or (self.rows * cell_h)
+    -- 候选字条(独占键盘上方的窄条带): 下沿吃到底(=InputText 底=键盘上沿,
+    -- 与辣条普通模式同位), 高度严格 = bar_h(与辣条统一、上下间距 0); 网格
+    -- 末行与条带上沿之间露出网格取整余数的白缝(≤一行字符高, 大背景铺白)。
+    -- 仅 IME(zh 系)布局显示候选文字; EN 等直通布局只留白底。
     local grid_bottom = gy + self.rows * cell_h
-    -- 条带下沿要吃到底: InputText 自身的下内边距(margin+border+padding)在
-    -- 我们的绘制区之外, 但它仍是白底, 继续向下铺满才能让候选字真正贴住
-    -- 键盘按钮行(否则会留一条 20 多像素的空白)
+    local avail_h = self.avail_rows_h or (self.rows * cell_h)
     local band_bottom = gy + avail_h + (self.bar_h or 0) + (self._inner_off or 0)
+    local band_top = band_bottom - (self.bar_h or 0)
     if self._vt_bar_visible == false then return end
     if (self.bar_h or 0) <= 0 then return end -- 直通布局: 条带高度已归零
     -- 辣条 widget 本体模式：白底+细线+候选文字全部由 ImeBar widget 在锚定矩形
@@ -1733,8 +1764,8 @@ function VTermView:paintTo(bb, x, y)
     -- 相同的矩形上双重绘制，还用 fast(A2) 与 ui 两种波形刷同一区域，是残影
     -- 清不干净的根源。条带白底已由本函数开头的大背景(:1593)铺底，无空洞。
     if self._vt_imebar_active then return end
-    bb:paintRect(gx, grid_bottom, gw, band_bottom - grid_bottom, Blitbuffer.COLOR_WHITE)
-    bb:paintRect(gx, grid_bottom, gw, 2, Blitbuffer.COLOR_LIGHT_GRAY)
+    bb:paintRect(gx, band_top, gw, band_bottom - band_top, Blitbuffer.COLOR_WHITE)
+    bb:paintRect(gx, band_top, gw, 2, Blitbuffer.COLOR_LIGHT_GRAY)
     -- 非 widget 模式(EN/原生回退)：仍画草稿条带。
     -- 条带只显示当前组词草稿: 已提交字词选中即发送、选中即从条带消失,
     -- 不残留干扰后续组词(已提交内容以终端网格回显为准)。
@@ -1751,9 +1782,8 @@ function VTermView:paintTo(bb, x, y)
             tw:free()
             tw = TextWidget:new{ text = draft, face = self.bar_face, fgcolor = Blitbuffer.COLOR_BLACK }
         end
-        -- 墨迹在条带内垂直居中(行盒留白不再决定位置): 上方到分割线、下方到
-        -- 键盘的空白相等, 不再出现"字贴着键盘、顶上却空一大截"
-        local area_top = grid_bottom + 2
+        -- 墨迹在条带内垂直居中: 上方到分割线、下方到键盘的空白相等
+        local area_top = band_top + 2
         local area_h = band_bottom - area_top
         local ink_top_y = area_top
             + math.max(0, math.floor((area_h - (self.cjk_ink_h or 0)) / 2))

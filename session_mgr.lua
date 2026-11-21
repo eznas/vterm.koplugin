@@ -170,6 +170,15 @@ function SessionMgr:buildLaunchCommand(session)
         table.insert(args, "-i")
         table.insert(args, session.key_path)
     end
+    if bin:find("dbclient") then
+        -- TCP 半开假活防线(2026-11-21 219 实证): 设备休眠/断网后 dbclient 进程
+        -- 仍在但数据流已死 —— 输入写出去石沉大海(clear 都不执行), 读端无数据,
+        -- 屏幕停在死前最后一帧(输入"不显示"、排版错乱全是旧帧残留)。无 EOF 则
+        -- drain 不触发, 会话永远假活。-K keepalive 探测失败即退出 → 读到 EOF
+        -- 走 drain 自动关会话, 用户重连即可。
+        table.insert(args, "-K")
+        table.insert(args, "10")
+    end
     if not bin:find("dbclient") then
         table.insert(args, "-o")
         -- accept-new: 首连自动记录指纹, 指纹变更仍拒绝(MITM 防护保留);

@@ -283,6 +283,7 @@ function VTermView:_vtBarDraftText()
     end
     if ime_text ~= "" then return lit .. code .. " " .. ime_text end
     return lit .. code -- 组合中无候选(自定义码前缀)时也显码
+    -- (返回前不截尾: 调用方条带 TextWidget 自带宽度截断; preedit 路径单独截)
 end
 
 -- 条带按布局自适应: IME 布局保留全高(组词/候选唯一绘制处), 直通布局归零。
@@ -469,7 +470,9 @@ function VTermView:_cellBgGray(cell)
     local bg = cell.bg
     if not bg then return nil end
     if bit.band(bg.type, 0x01) == 0x01 and bg.indexed.idx == 248 then
-        return gray(indexedLum(248))
+        -- 选区灰 168 向白挪 1/3 → 197(用户定调"调浅1/3", 真机目视偏深)
+        local lum = indexedLum(248)
+        return gray(lum + math.floor((255 - lum) / 3))
     end
     return nil
 end
@@ -1612,6 +1615,12 @@ function VTermView:paintTo(bb, x, y)
     local gw = self.cols * self.cell_w
     local gh = self.rows * self.cell_h
 
+    -- 无 screen 的 view 什么都不画(2026-11-21 219 白屏防御): 切键盘布局经
+    -- InputDialog:reinit 重建 view, 重建瞬间/damage 竞态里可能拿到未挂 screen 的
+    -- VTermView(vt=nil)。它若先画白底再 return 会盖住真会话 = 白屏。根治在 main.lua
+    -- 的 reinit hook 补挂 vt/screen; 这里是通用底线——检查必须早于白底 paintRect。
+    if not self.screen then return end
+
     -- 纯白背景打底：widget 模式下铺到「条带顶」为止(高度 avail_h + off)，
     -- 条带区(bar_h)完全交给 ImeBar widget。此前铺到条带下沿，vterm 因网格变化
     -- 重绘时白底会盖掉 widget 刚画的候选字(两者 paintTo 顺序不固定) → 概率性
@@ -1621,8 +1630,6 @@ function VTermView:paintTo(bb, x, y)
     local bg_h = (avail_h + (self._inner_off or 0))
         + ((self._vt_imebar_active and 0) or ((self.bar_h or 0) + (self._inner_off or 0)))
     bb:paintRect(gx, gy, gw, bg_h, Blitbuffer.COLOR_WHITE)
-
-    if not self.screen then return end
 
     local screen = self.screen
     local vt_lib = self.vt_lib
@@ -1736,6 +1743,9 @@ function VTermView:paintTo(bb, x, y)
                 local lit = (live and not live.v_text and live._literal) or ""
                 local code = (live and not live.v_text and live.imebar_code) or nil
                 local pe = lit .. (code or "")
+                -- 防失控截尾: preedit 超出半屏宽就不画(宽字符布局残留的超长串
+                -- 曾把 invertRect 光标块推出网格 onto 键盘区成灰方块)
+                if #pe > 40 then pe = pe:sub(-40) end
                 if pe ~= "" then
                     -- 先画黑字，光标块移到码末尾 —— 光标块是黑底 invertRect，
                     -- 若先画它会把 preedit 首字母吃掉（黑字压黑块看不见）。

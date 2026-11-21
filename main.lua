@@ -98,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.5.4" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.5.5" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{
@@ -974,6 +974,21 @@ function VTermPlugin:startTerminal(session, opts)
     self.view = view
     view._vt_local = (session.type ~= "ssh") -- 本地会话需适配 busybox vi 字节级退格
     view._vt_plugin = self -- Ctrl 挂起等跨实例状态存插件单例
+
+    -- 切键盘布局(中/日/英)白屏根治(2026-11-21): 原生 setKeyboardLayout 在键盘
+    -- 行数变化时经 onKeyboardHeightChanged=InputDialog:reinit 原地重建 _input_widget,
+    -- 新 VTermView 的 vt/screen 全 nil → paintTo 白底早退 → 网格全白(必须按标题栏
+    -- 全屏键刷回旧 view 才恢复)。这条 reinit 路径不经过 _toggleKeyboardBar/字号重建,
+    -- 是唯一漏挂 reattach 的重建路径。hook 进去, reinit 后补挂 vt/screen/pty。
+    -- 该 dialog 对象 reinit 时身份不变, hook 只装一次。
+    if not rawget(self.dialog, "_vt_hcc_hooked") then
+        rawset(self.dialog, "_vt_hcc_hooked", true)
+        local orig_hcc = self.dialog.onKeyboardHeightChanged
+        self.dialog.onKeyboardHeightChanged = function(dlg, ...)
+            if orig_hcc then orig_hcc(dlg, ...) end -- = reinit, 已换新 _input_widget
+            self:_reattachVTerm()
+        end
+    end
     -- 默认态(⇆关)也必须注册基础手势: 否则全新会话里 ⇕ 开启后上下滑无人处理
     -- (以前只有切换过 ⇆ 才会走到 setArrowGestures, 首启默认状态手势全丢)
     view:setArrowGestures(false)
@@ -1175,6 +1190,16 @@ function VTermPlugin:schedulePtyRead()
             self:_feedVterm(chunk)
         end
         self:closeTerminal()
+        -- 断线告知(2026-11-21): keepalive 探测失败后 dbclient 自动退出走到这里
+        -- (或远端 exit)。静默关闭在墨水屏上 = 一瞬白屏后回文件管理器, 用户以为
+        -- KOReader 坏了(219 实证)。closeTerminal 后弹, 会话态已清, UI 在 FM 层。
+        pcall(function()
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = gettext("连接已断开（SSH 超时/远端退出），可重新连接会话"),
+                timeout = 3,
+            })
+        end)
         return
     end
 

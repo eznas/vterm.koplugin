@@ -456,38 +456,22 @@ local function gray(lum)
     return c
 end
 
--- cell 背景色 → e-ink 灰阶 Color8(无背景返回 nil)。
--- 位定义(libvterm vterm.h): TYPE_MASK=0x01(0=RGB,1=INDEXED),
--- DEFAULT_FG=0x02, DEFAULT_BG=0x04。
--- ⚠️ 深色背景(亮度<100)不画: libvterm 默认 pen 的 bg = RGB(0,0,0) 黑
--- (vterm 库暗色终端约定, state.c:163), vim 历史行的格子都带这种 RGB 黑
--- 背景 → 按亮度渲染会把整屏历史涂黑(真机黑屏实证)。
--- 本地 vim VISUAL 选区 = indexed 248; 远端 vim 选区色可能是任意 indexed
--- (含 reverse), 只要有浅色背景就渲染灰底黑字。
+-- cell 背景色 → e-ink 灰阶 Color8。
+-- **2026-11-21 用户定调两步走**: ①背景渲染停用 —— tmux/pi 等应用的灰背景
+-- (状态行/面板/高亮/bce 填充)在墨水屏上全是噪音; ②但 vim VISUAL 触摸选区
+-- 必须有视觉反馈 —— 本地 vim 选区 = indexed 248(浅灰), 白名单放行。
+-- 其余一律不画, 只留白底黑字 + reverse 反白(黑底白字是文字语义不算背景)。
+-- 历史教训(留档): ①libvterm 默认 pen bg=RGB 黑, 按亮度渲染会涂黑全屏历史;
+-- ②termux 彩色输出行尾 bce 擦除填深色 bg 空白格, 恢复主屏后成洗不掉的
+-- 灰块(灰在 fb 里, full 刷新如实重刷); ③VTermScreenCell 无 s 成员, 字符在
+-- chars[] uint32 码点数组(空格=32, 空=0), FFI 结构上访问 .s 直接崩溃。
 function VTermView:_cellBgGray(cell)
     local bg = cell.bg
     if not bg then return nil end
-    local t = bg.type
-    if bit.band(t, 0x04) ~= 0 then return nil end -- DEFAULT_BG: 不画背景
-    if bit.band(t, 0x01) == 0x01 then -- INDEXED
-        local lum = indexedLum(bg.indexed.idx)
-        -- indexed 深色是应用有意的深色高亮(远端 vim Visual 选区 ctermbg=238
-        -- 等, 属性探针实证), e-ink 上黑底黑字无法分辨 → 重映射浅灰底黑字
-        if lum < 100 then
-            -- 空白格+深色底 = 行尾 bce 擦除填充(termux "did you mean" 等输出,
-            -- 2026-11-21 真机 fb 实证: 退出 vim 恢复主屏后文字外空白被 180 灰
-            -- 填满, full 刷新洗不掉 —— 灰在 fb 里, 重刷如实上屏)。无字可衬,
-            -- 深底没意义 → 不画, 洗白。有字的格子照旧重映射保深底字可读。
-            -- 代价(ponytail): 全屏深色 TUI(mc/htop)的空白底会变白, 属可接受妥协。
-            -- 浅色 bg(本地 vim 选区 248)不受影响。
-            if cell.s == "" or cell.s == " " then return nil end
-            return gray(180)
-        end
-        return gray(lum)
+    if bit.band(bg.type, 0x01) == 0x01 and bg.indexed.idx == 248 then
+        return gray(indexedLum(248))
     end
-    local lum = math.floor((bg.rgb.red * 30 + bg.rgb.green * 59 + bg.rgb.blue * 11) / 100)
-    if lum < 100 then return nil end -- RGB 深色 = 库默认黑 pen(state.c:163), 不画防全屏涂黑
-    return gray(lum)
+    return nil
 end
 
 -- 防止点击终端画布时原生 InputText 移动单行光标;

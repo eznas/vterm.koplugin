@@ -101,11 +101,16 @@ void vterm_bridge_set_callbacks(VTermScreen *screen, VTermBridgeCallbacks *bridg
 local VTermFFI = {}
 
 function VTermFFI.load(plugin_dir)
-    -- ARM 设备优先:两套 .so 会同时随插件分发,文件存在不代表本机能加载,
-    -- ARM .so 在模拟器(x86_64)上必然加载失败,自然回落 x86_64。
-    -- 两条分支只差路径前缀(plugin_dir 或 ./), 统一成一份。
+    -- 按本机 LuaJIT 的浮点 ABI 依次试三套 .so, 不匹配的会被 ld.so 拒绝, pcall 落到
+    -- 下一条: Kobo/armhf(硬浮点)→ lib/armv7_hardfp; Kindle(软浮点)→ lib/armv7_softfp;
+    -- 模拟器(x86_64)→ lib/x86_64。文件存在不代表能加载, 探测失败是常态路径。
+    -- 三条分支只差路径前缀(plugin_dir 或 ./), 统一成一份。
     local base = plugin_dir or "."
-    local ok, lib = pcall(ffi.load, base .. "/lib/armv7_softfp/libvterm.so")
+    local ok, lib = pcall(ffi.load, base .. "/lib/armv7_hardfp/libvterm.so")
+    if ok then
+        return lib
+    end
+    ok, lib = pcall(ffi.load, base .. "/lib/armv7_softfp/libvterm.so")
     if ok then
         return lib
     end

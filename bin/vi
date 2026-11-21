@@ -2,4 +2,4 @@
 # busybox vi(字节级): 光标按 UTF-8 字节数前进, 宽字符需 #字节 个退格删净。
 # editor.kind=byte → vterm 插件按字节级语义(见 PTY:editorByteLevel)。
 ( printf byte > "$(dirname "$0")/editor.kind" 2>/dev/null ) || true
-exec /mnt/us/koreader/plugins/vterm.koplugin/bin/busybox vi "$@"
+exec "$(dirname "$0")/busybox" vi "$@"

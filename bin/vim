@@ -4,5 +4,6 @@
 # 旧 busybox vi 仍可经 `vi` 命令使用(字节级, 见 bin/vi)。
 ( printf wide > "$(dirname "$0")/editor.kind" 2>/dev/null ) || true
 # 帮助文件(:h)位置: 插件自带 vimruntime(doc/*.txt.gz + tags + gzip.vim)
-export VIMRUNTIME=/mnt/us/koreader/plugins/vterm.koplugin/vimruntime
-exec /mnt/us/koreader/plugins/vterm.koplugin/bin/vim.real -u /mnt/us/koreader/plugins/vterm.koplugin/bin/vimrc "$@"
+DIR=$(dirname "$0")
+export VIMRUNTIME="$DIR/../vimruntime"
+exec "$DIR/vim.real" -u "$DIR/vimrc" "$@"

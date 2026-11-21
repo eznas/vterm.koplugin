@@ -98,7 +98,7 @@ local _ = function(s)
     if _isZhUi() then return gettext(s) end
     return EN_STRS[s] or s
 end
-local VTERM_VERSION = "v1.5.2" -- "关于"弹窗展示
+local VTERM_VERSION = "v1.5.3" -- "关于"弹窗展示
 local ffi = require("ffi")
 
 local VTermPlugin = WidgetContainer:extend{

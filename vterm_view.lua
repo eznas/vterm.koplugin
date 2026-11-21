@@ -273,10 +273,16 @@ function VTermView:_vtBarDraftText()
     end
     local IME = package.loaded["ui/data/keyboardlayouts/generic_ime"]
     local live = IME and IME._live
+    -- 直通字符(大写首字母/未映射符号)不进引擎码桶, 引擎记在 _literal; 不拼上
+    -- 则预览缺字符(vterm 打 "Test": T 隐形, 只显 est)
+    local lit = (live and not live.v_text and live._literal) or ""
     local code = (live and not live.v_text and live.imebar_code) or nil
-    if not code or code == "" then return ime_text end
-    if ime_text ~= "" then return code .. " " .. ime_text end
-    return code -- 组合中无候选(自定义码前缀)时也显码
+    if not code or code == "" then
+        if lit ~= "" then return lit .. ime_text end
+        return ime_text
+    end
+    if ime_text ~= "" then return lit .. code .. " " .. ime_text end
+    return lit .. code -- 组合中无候选(自定义码前缀)时也显码
 end
 
 -- 条带按布局自适应: IME 布局保留全高(组词/候选唯一绘制处), 直通布局归零。
@@ -467,7 +473,16 @@ function VTermView:_cellBgGray(cell)
         local lum = indexedLum(bg.indexed.idx)
         -- indexed 深色是应用有意的深色高亮(远端 vim Visual 选区 ctermbg=238
         -- 等, 属性探针实证), e-ink 上黑底黑字无法分辨 → 重映射浅灰底黑字
-        if lum < 100 then return gray(180) end
+        if lum < 100 then
+            -- 空白格+深色底 = 行尾 bce 擦除填充(termux "did you mean" 等输出,
+            -- 2026-11-21 真机 fb 实证: 退出 vim 恢复主屏后文字外空白被 180 灰
+            -- 填满, full 刷新洗不掉 —— 灰在 fb 里, 重刷如实上屏)。无字可衬,
+            -- 深底没意义 → 不画, 洗白。有字的格子照旧重映射保深底字可读。
+            -- 代价(ponytail): 全屏深色 TUI(mc/htop)的空白底会变白, 属可接受妥协。
+            -- 浅色 bg(本地 vim 选区 248)不受影响。
+            if cell.s == "" or cell.s == " " then return nil end
+            return gray(180)
+        end
         return gray(lum)
     end
     local lum = math.floor((bg.rgb.red * 30 + bg.rgb.green * 59 + bg.rgb.blue * 11) / 100)
@@ -1732,11 +1747,15 @@ function VTermView:paintTo(bb, x, y)
             if self._vt_imebar_active then
                 local IME = package.loaded["ui/data/keyboardlayouts/generic_ime"]
                 local live = IME and IME._live
+                -- 直通字符(大写首字母/未映射符号)在引擎 _literal 里, 不进码桶;
+                -- 不拼上则 preedit 缺字符(vterm 打 "Test": T 隐形, 只显 est)
+                local lit = (live and not live.v_text and live._literal) or ""
                 local code = (live and not live.v_text and live.imebar_code) or nil
-                if code and code ~= "" then
+                local pe = lit .. (code or "")
+                if pe ~= "" then
                     -- 先画黑字，光标块移到码末尾 —— 光标块是黑底 invertRect，
                     -- 若先画它会把 preedit 首字母吃掉（黑字压黑块看不见）。
-                    local tw = TextWidget:new{ text = code, face = self.face_mono,
+                    local tw = TextWidget:new{ text = pe, face = self.face_mono,
                         fgcolor = Blitbuffer.COLOR_BLACK }
                     local tw_w = tw:getSize().w
                     tw:paintTo(bb, cur_x, cur_y + baseline - tw:getBaseline())

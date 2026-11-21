@@ -114,6 +114,17 @@ local VTermPlugin = WidgetContainer:extend{
 }
 
 function VTermPlugin:init()
+    -- KOReader ReaderUI 创建书内插件实例时, 按"阅读器插件公共约定"注入
+    -- dialog = ReaderUI.dialog(self 兜底, readerui.lua:126) 与
+    -- view = ReaderUI.view(ReaderView 文档视图)。vterm 的终端状态字段恰好
+    -- 撞名: 书内实例的 self.dialog 因此恒非空 → startTerminal 的"旧会话未关
+    -- 先关"分支误触发, closeTerminal 对 ReaderView 调 _vt_releaseImebar →
+    -- 方法不存在 → 整进程崩溃(2026-11-21 219 两次闪退根因)。vterm 从不读
+    -- ui.dialog/ui.view, 会话状态只由 startTerminal/closeTerminal 管理,
+    -- 构造时剥掉注入, FM/Reader 两实例从一致的空状态起步。
+    self.dialog = nil
+    self.view = nil
+    self.pty = nil
     self.vt_lib = VTermFFI.load(self.path)
     self.session_mgr = SessionMgr.new(self.path .. "/sessions.json", self.path)
     self:ensureLocale() -- 首次启动编译 UTF-8 locale(后台一次, 失败无碍)
